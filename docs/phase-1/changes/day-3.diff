@@ -1,0 +1,943 @@
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/.env.example day-3/.env.example
+--- day-2/.env.example	2026-11-19 00:20:08
++++ day-3/.env.example	2026-11-19 00:27:28
+@@ -2,3 +2,19 @@
+ # Every variable is optional; the defaults are shown.
+ 
+ LOG_LEVEL=INFO
++
++# --- LiteLLM proxy (Day 3) -----------------------------------------------------------
++# REQUIRED: LiteLLM 1.110 refuses to start without a strong master key. Generate YOUR OWN
++# key once (never share or commit it) by running this in trailmate-workflow/:
++#   printf 'LITELLM_MASTER_KEY=sk-%s\n' "$(openssl rand -hex 32)" >> .env
++# The proxy reads it via litellm/config.yaml (os.environ/LITELLM_MASTER_KEY), and the app
++# sends it as "Authorization: Bearer ..." (LITELLM_API_KEY, falling back to LITELLM_MASTER_KEY).
++# LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
++
++# LITELLM_BASE_URL=http://127.0.0.1:4000/v1
++# TRAIL_TIER=smart
++# GENERAL_TIER=fast
++# MODEL_TIMEOUT_S=60
++# MODEL_MAX_RETRIES=1
++# MODEL_MAX_TOKENS=300
++# MODEL_TEMPERATURE=0.3
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/README.md day-3/README.md
+--- day-2/README.md	2026-11-19 00:23:38
++++ day-3/README.md	2026-11-19 00:32:24
+@@ -1,27 +1,38 @@
+ # trailmate-workflow
+ 
+-TrailMate's Phase 1 workflow service: FastAPI in front of a LangGraph graph whose path is decided by plain code.
++TrailMate's Phase 1 workflow service: FastAPI in front of a LangGraph graph whose path is decided by plain code. A local model, reached through LiteLLM tiers, writes only the text.
+ 
+-> Day 2 state: rule-based classification routes each message down one of three fixed paths (trail / general / reject), each with a templated reply.
++> Day 3 state: trail questions are answered by the `smart` tier and chit-chat by the `fast` tier, both through the LiteLLM proxy to local Ollama models. Reject stays a fixed template. If the model can't be reached, the path falls back to a fixed reply.
+ 
+-## Quick start
++## Run it
+ 
++### 1. One-time setup
++
+ ```bash
+ cd trailmate-workflow
+-uv sync                                    # creates .venv from uv.lock (Python 3.14)
+-uv run uvicorn trailmate_workflow.api:app --host 127.0.0.1 --port 8000
++uv sync                                   # Python 3.14 + dependencies from uv.lock
++./scripts/pull-models.sh                  # llama3.2:1b (fast) + qwen3:4b-instruct (smart), ~3.8 GB
++cp .env.example .env
++printf 'LITELLM_MASTER_KEY=sk-%s\n' "$(openssl rand -hex 32)" >> .env   # your own local proxy key
+ ```
+ 
+-In another terminal, send one message per path:
++LiteLLM 1.110 **refuses to start without a master key**. The last command creates your own key in `.env`, which is gitignored. Never commit or share it. The app reads the same key from `.env` automatically.
+ 
++### 2. Start the services (two terminals)
++
+ ```bash
+-for m in "easy hike with a waterfall?" "hello!" "write me some python code"; do
++./scripts/run-proxy.sh                    # terminal 1: LiteLLM proxy on 127.0.0.1:4000
++./scripts/warm-up.sh                      # optional: load both models now (avoids a cold start)
++uv run uvicorn trailmate_workflow.api:app --host 127.0.0.1 --port 8000   # terminal 2
++```
++
++### 3. Try it
++
++```bash
++for m in "easy hike near a lake?" "hello!" "write me some python code"; do
+   curl -s -X POST 127.0.0.1:8000/chat -H 'content-type: application/json' \
+-    -d "{\"message\":\"$m\"}" | jq -c '{route, path: [.trace[].node]}'
++    -d "{\"message\":\"$m\"}" | jq -c '{route, tier, model, fallback_used, response}'
+ done
+-# {"route":"trail","path":["receive","classify","trail_reply","respond"]}
+-# {"route":"general","path":["receive","classify","general_reply","respond"]}
+-# {"route":"reject","path":["receive","classify","reject_reply","respond"]}
+ ```
+ 
+ ## Endpoints
+@@ -29,10 +40,23 @@
+ | Method and path | Body | Returns |
+ |---|---|---|
+ | `GET /health` | — | `{"status": "ok"}` |
+-| `POST /chat` | `{"message": "..."}` (1–10,000 chars) | `{request_id, response, route, trace}` |
++| `POST /chat` | `{"message": "..."}` (1–10,000 chars) | `{request_id, response, route, tier, model, fallback_used, trace}` |
+ 
+ Interactive docs: http://127.0.0.1:8000/docs
+ 
++## Configuration (env vars or `.env`)
++
++| Variable | Default | Meaning |
++|---|---|---|
++| `LITELLM_MASTER_KEY` | — (required by the proxy) | The proxy's key. The app sends it too (fallback for `LITELLM_API_KEY`). |
++| `LITELLM_BASE_URL` | `http://127.0.0.1:4000/v1` | Where the proxy is |
++| `TRAIL_TIER` / `GENERAL_TIER` | `smart` / `fast` | Which tier each path asks for |
++| `MODEL_TIMEOUT_S` / `MODEL_MAX_RETRIES` | `60` / `1` | Per model call |
++| `MODEL_MAX_TOKENS` / `MODEL_TEMPERATURE` | `300` / `0.3` | Generation limits |
++| `LOG_LEVEL` | `INFO` | |
++
++Which real model sits behind each tier is set in [litellm/config.yaml](litellm/config.yaml), not in the app.
++
+ ## Graph
+ 
+ Generated from the compiled graph with `uv run trailmate graph`. Dotted arrows are conditional edges, chosen by `route_by_category`.
+@@ -57,16 +81,19 @@
+ | `src/trailmate_workflow/config.py` | Settings from env / `.env` (pydantic-settings) |
+ | `src/trailmate_workflow/normalize.py` | Unicode/whitespace normalization |
+ | `src/trailmate_workflow/classifier.py` | Rule-based classification (reject → trail → general → default) |
+-| `src/trailmate_workflow/templates.py` | Fixed replies |
+-| `src/trailmate_workflow/graph/` | `state.py` (state + trace reducer), `nodes.py`, `routing.py` (conditional edges), `builder.py` |
++| `src/trailmate_workflow/llm.py` | Tier → `ChatOpenAI` client pointed at the proxy |
++| `src/trailmate_workflow/prompts.py`, `templates.py` | System prompts; fixed replies and fallbacks |
++| `src/trailmate_workflow/graph/` | `state.py`, `nodes.py`, `model_nodes.py`, `routing.py`, `builder.py` |
++| `src/trailmate_workflow/schemas.py`, `api.py` | HTTP contract and FastAPI app |
+ | `src/trailmate_workflow/cli.py` | `uv run trailmate graph` |
+-| `src/trailmate_workflow/schemas.py` | Request/response models |
+-| `src/trailmate_workflow/api.py` | FastAPI app, lifespan, routes |
+-| `tests/` | pytest suite |
++| `litellm/config.yaml` | Tier → Ollama model mapping, fallback, timeouts |
++| `scripts/` | `pull-models.sh`, `run-proxy.sh`, `warm-up.sh` |
++| `tests/` | pytest suite (fake models; no Ollama needed) |
+ 
+ ## Tests
+ 
+ ```bash
+-uv run pytest -q
++uv run pytest -q                                   # hermetic: no proxy or Ollama needed
++RUN_INTEGRATION=1 uv run pytest -m integration -q  # live: needs the proxy + Ollama running
+ uv run ruff check . && uv run ruff format --check .
+ ```
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/litellm/config.yaml day-3/litellm/config.yaml
+--- day-2/litellm/config.yaml	1970-01-01 05:30:00
++++ day-3/litellm/config.yaml	2026-11-19 00:25:28
+@@ -0,0 +1,30 @@
++# LiteLLM proxy config: named model TIERS in front of local Ollama models.
++#
++# The app only ever asks for "fast" or "smart". Which real model sits behind a tier is
++# decided HERE, so swapping models never touches application code.
++#
++# Start the proxy with:  ./scripts/run-proxy.sh   (serves http://127.0.0.1:4000)
++
++model_list:
++  - model_name: fast                       # tier name the app requests
++    litellm_params:
++      model: ollama_chat/llama3.2:1b       # ollama_chat/ → Ollama's /api/chat (not ollama/ → /api/generate)
++      api_base: http://127.0.0.1:11434
++      keep_alive: 30m                      # keep the model in memory (default 5m → cold starts)
++  - model_name: smart
++    litellm_params:
++      model: ollama_chat/qwen3:4b-instruct # non-thinking Qwen3-4B-Instruct-2507 (NOT plain qwen3:4b)
++      api_base: http://127.0.0.1:11434
++      keep_alive: 30m
++
++litellm_settings:
++  request_timeout: 60                      # seconds per model call
++  num_retries: 1
++
++router_settings:
++  fallbacks: [{"smart": ["fast"]}]         # if "smart" fails, LiteLLM retries the call on "fast"
++
++general_settings:
++  # Optional locally. When LITELLM_MASTER_KEY is set (see .env.example), every request
++  # must send "Authorization: Bearer <key>". The value is never written in this file.
++  master_key: os.environ/LITELLM_MASTER_KEY
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/pyproject.toml day-3/pyproject.toml
+--- day-2/pyproject.toml	2026-11-19 00:23:12
++++ day-3/pyproject.toml	2026-11-19 00:29:28
+@@ -10,6 +10,7 @@
+ dependencies = [
+     "fastapi>=0.164.0",
+     "langchain-core>=1.8.3",
++    "langchain-openai>=1.8.2",
+     "langgraph>=1.2.22",
+     "pydantic-settings>=2.16.3",
+     "uvicorn[standard]>=0.54.0",
+@@ -34,6 +35,7 @@
+ testpaths = ["tests"]
+ asyncio_mode = "auto"
+ asyncio_default_fixture_loop_scope = "function"
++markers = ["integration: needs the LiteLLM proxy + Ollama running (RUN_INTEGRATION=1)"]
+ filterwarnings = [
+     # Third-party noise on Python 3.14: langsmith (pulled in by langchain-core) still calls
+     # asyncio.iscoroutinefunction. Filtered by exact message, so new warnings still show.
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/scripts/pull-models.sh day-3/scripts/pull-models.sh
+--- day-2/scripts/pull-models.sh	1970-01-01 05:30:00
++++ day-3/scripts/pull-models.sh	2026-11-19 00:25:29
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++# Download the two local models behind TrailMate's tiers (~3.8 GB in total).
++# Keep these tags identical to litellm/config.yaml.
++set -euo pipefail
++
++ollama pull llama3.2:1b        # tier "fast"  (~1.3 GB)
++ollama pull qwen3:4b-instruct  # tier "smart" (~2.5 GB). Not plain qwen3:4b, which always "thinks"
++ollama list
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/scripts/run-proxy.sh day-3/scripts/run-proxy.sh
+--- day-2/scripts/run-proxy.sh	1970-01-01 05:30:00
++++ day-3/scripts/run-proxy.sh	2026-11-19 00:27:27
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++# Start the LiteLLM proxy on http://127.0.0.1:4000 with TrailMate's tier config.
++#
++# LiteLLM runs as an isolated uv *tool* (uvx): its very large dependency tree never
++# touches the service's own environment, just like a separately deployed proxy in
++# production. The version is pinned so every run behaves the same.
++set -euo pipefail
++cd "$(dirname "$0")/.."                                  # the trailmate-workflow directory
++
++if [ -f .env ]; then set -a; . ./.env; set +a; fi        # export LITELLM_MASTER_KEY etc., if set
++
++# LiteLLM (>= 1.10x) refuses to start without a strong master key. Fail fast, with the fix.
++if [ -z "${LITELLM_MASTER_KEY:-}" ] && [ "${LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY:-}" != "true" ]; then
++  echo "LITELLM_MASTER_KEY is not set. Create your own local key once (stored in .env, gitignored):" >&2
++  echo "  printf 'LITELLM_MASTER_KEY=sk-%s\n' \"\$(openssl rand -hex 32)\" >> .env" >&2
++  exit 1
++fi
++
++exec uvx --from "litellm[proxy]==1.110.0" litellm \
++  --config litellm/config.yaml --host 127.0.0.1 --port 4000
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/scripts/warm-up.sh day-3/scripts/warm-up.sh
+--- day-2/scripts/warm-up.sh	1970-01-01 05:30:00
++++ day-3/scripts/warm-up.sh	2026-11-19 00:25:30
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++# Load both tiers' models into memory before a demo. The first request after a model
++# has been unloaded pays a cold start (several seconds); this pays it up front.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++if [ -f .env ]; then set -a; . ./.env; set +a; fi
++
++PROXY="${LITELLM_PROXY:-http://127.0.0.1:4000}"
++for tier in fast smart; do
++  printf 'warming %-5s ... ' "$tier"
++  curl -sf "$PROXY/v1/chat/completions" \
++    -H 'content-type: application/json' \
++    -H "Authorization: Bearer ${LITELLM_MASTER_KEY:-no-key}" \
++    -d "{\"model\":\"$tier\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" \
++    -o /dev/null \
++    && echo ok \
++    || { echo "FAILED (is the proxy running? ./scripts/run-proxy.sh)"; exit 1; }
++done
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/api.py day-3/src/trailmate_workflow/api.py
+--- day-2/src/trailmate_workflow/api.py	2026-11-19 00:19:14
++++ day-3/src/trailmate_workflow/api.py	2026-11-19 00:31:39
+@@ -16,6 +16,7 @@
+ from trailmate_workflow.config import Settings, get_settings
+ from trailmate_workflow.graph.builder import build_graph
+ from trailmate_workflow.graph.state import initial_state
++from trailmate_workflow.llm import make_reply_models
+ from trailmate_workflow.schemas import ChatRequest, ChatResponse
+ 
+ logger = logging.getLogger("trailmate")
+@@ -37,8 +38,8 @@
+         # Runs once at startup (before `yield`) and once at shutdown (after it).
+         logging.basicConfig(level=settings.log_level, format="%(levelname)s %(name)s: %(message)s")
+         # Compile once and reuse: a compiled graph holds no per-request state, so all
+-        # requests can share it safely.
+-        app.state.graph = build_graph()
++        # requests can share it safely. Building the model clients makes no network call.
++        app.state.graph = build_graph(make_reply_models(settings))
+         yield
+ 
+     app = FastAPI(title="TrailMate workflow", version="0.1.0", lifespan=lifespan)
+@@ -63,9 +64,12 @@
+ def log_request(response: ChatResponse, started: float) -> None:
+     """One metadata-only log line per request: never the message or reply text."""
+     logger.info(
+-        "request_id=%s route=%s nodes=%s total_ms=%.1f",
++        "request_id=%s route=%s tier=%s model=%s fallback=%s nodes=%s total_ms=%.1f",
+         response.request_id,
+         response.route,
++        response.tier,
++        response.model,
++        response.fallback_used,
+         ",".join(step.node for step in response.trace),
+         (time.perf_counter() - started) * 1000,
+     )
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/cli.py day-3/src/trailmate_workflow/cli.py
+--- day-2/src/trailmate_workflow/cli.py	2026-11-19 00:23:13
++++ day-3/src/trailmate_workflow/cli.py	2026-11-19 00:31:39
+@@ -5,7 +5,9 @@
+ 
+ import argparse
+ 
++from trailmate_workflow.config import get_settings
+ from trailmate_workflow.graph.builder import build_graph
++from trailmate_workflow.llm import make_reply_models
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+@@ -17,7 +19,8 @@
+     if args.command == "graph":
+         # draw_mermaid() is pure text, computed locally. (draw_mermaid_png() would call an
+         # external web API, so it's deliberately not used.)
+-        print(build_graph().get_graph().draw_mermaid())
++        graph = build_graph(make_reply_models(get_settings()))  # no network call
++        print(graph.get_graph().draw_mermaid())
+     return 0
+ 
+ 
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/config.py day-3/src/trailmate_workflow/config.py
+--- day-2/src/trailmate_workflow/config.py	2026-11-19 00:18:16
++++ day-3/src/trailmate_workflow/config.py	2026-11-19 00:31:04
+@@ -6,6 +6,7 @@
+ 
+ from functools import lru_cache
+ 
++from pydantic import AliasChoices, Field, SecretStr
+ from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
+ 
+@@ -13,6 +14,23 @@
+     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+ 
+     log_level: str = "INFO"
++
++    # --- Day 3: model calls go to the LiteLLM proxy (an OpenAI-compatible API) ---
++    litellm_base_url: str = "http://127.0.0.1:4000/v1"
++    # The key the app sends to the proxy. Read from LITELLM_API_KEY, falling back to
++    # LITELLM_MASTER_KEY, so one key in .env serves both the proxy and the app locally.
++    # SecretStr keeps it out of reprs and logs.
++    litellm_api_key: SecretStr = Field(
++        default=SecretStr("no-key"),
++        validation_alias=AliasChoices("LITELLM_API_KEY", "LITELLM_MASTER_KEY"),
++    )
++    # Which tier each model-backed path uses. Tier names must exist in litellm/config.yaml.
++    trail_tier: str = "smart"
++    general_tier: str = "fast"
++    model_timeout_s: float = 60.0
++    model_max_retries: int = 1
++    model_max_tokens: int = 300
++    model_temperature: float = 0.3
+ 
+ 
+ @lru_cache
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/graph/builder.py day-3/src/trailmate_workflow/graph/builder.py
+--- day-2/src/trailmate_workflow/graph/builder.py	2026-11-19 00:23:12
++++ day-3/src/trailmate_workflow/graph/builder.py	2026-11-19 00:31:39
+@@ -3,21 +3,41 @@
+ from langgraph.graph import END, START, StateGraph
+ from langgraph.graph.state import CompiledStateGraph
+ 
++from trailmate_workflow import prompts, templates
+ from trailmate_workflow.graph import nodes
++from trailmate_workflow.graph.model_nodes import make_model_reply_node
+ from trailmate_workflow.graph.routing import route_by_category
+ from trailmate_workflow.graph.state import TrailState
++from trailmate_workflow.llm import ReplyModels
+ 
+ REPLY_NODES = ("trail_reply", "general_reply", "reject_reply")
+ 
+ 
+-def build_graph() -> CompiledStateGraph:
+-    """START → receive → classify →(route_by_category)→ one reply node → respond → END."""
++def build_graph(models: ReplyModels) -> CompiledStateGraph:
++    """START → receive → classify →(route_by_category)→ one reply node → respond → END.
++
++    `models` is injected (rather than created here) so tests can pass fakes and the app
++    can pass real proxy clients. The graph's SHAPE never depends on which models are used.
++    """
+     graph = StateGraph(TrailState)
+ 
+     graph.add_node("receive", nodes.receive)
+     graph.add_node("classify", nodes.classify)
+-    graph.add_node("trail_reply", nodes.trail_reply)
+-    graph.add_node("general_reply", nodes.general_reply)
++    graph.add_node(
++        "trail_reply",
++        make_model_reply_node(
++            "trail_reply", models.trail, prompts.TRAIL_SYSTEM_PROMPT, templates.TRAIL_FALLBACK_REPLY
++        ),
++    )
++    graph.add_node(
++        "general_reply",
++        make_model_reply_node(
++            "general_reply",
++            models.general,
++            prompts.GENERAL_SYSTEM_PROMPT,
++            templates.GENERAL_FALLBACK_REPLY,
++        ),
++    )
+     graph.add_node("reject_reply", nodes.reject_reply)
+     graph.add_node("respond", nodes.respond)
+ 
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/graph/model_nodes.py day-3/src/trailmate_workflow/graph/model_nodes.py
+--- day-2/src/trailmate_workflow/graph/model_nodes.py	1970-01-01 05:30:00
++++ day-3/src/trailmate_workflow/graph/model_nodes.py	2026-11-19 00:31:39
+@@ -0,0 +1,64 @@
++"""Model-backed reply nodes: the ONLY place a model is involved, and only to write text.
++
++The routing decision was already made (by plain code) before these nodes run. If the
++model call fails for any reason, the node falls back to a fixed template, and that
++fallback decision is code, not a model.
++"""
++
++import time
++from collections.abc import Awaitable, Callable
++from typing import Any
++
++from langchain_core.messages import HumanMessage, SystemMessage
++
++from trailmate_workflow.graph.state import TrailState, trace_step
++from trailmate_workflow.llm import TierModel, model_name_from
++
++Node = Callable[[TrailState], Awaitable[dict[str, Any]]]
++
++
++def make_model_reply_node(
++    node_name: str, tier_model: TierModel, system_prompt: str, fallback_reply: str
++) -> Node:
++    """Build a node that asks `tier_model` for a reply to the (normalized) user text.
++
++    A factory (a function that returns the node) lets one implementation serve every
++    model-backed path, each with its own tier, prompt, and fallback.
++    """
++
++    async def model_reply(state: TrailState) -> dict[str, Any]:
++        started = time.perf_counter()
++        messages = [SystemMessage(system_prompt), HumanMessage(state["text"])]
++        try:
++            message = await tier_model.model.ainvoke(messages)
++        except Exception as exc:  # proxy down, timeout, bad response, …: degrade, don't crash
++            # (asyncio.CancelledError is a BaseException, so a client disconnect still
++            # cancels the run instead of being swallowed here.)
++            return {
++                "reply": fallback_reply,
++                "tier": tier_model.tier,
++                "model": None,
++                "fallback_used": True,
++                "trace": [
++                    trace_step(
++                        node_name,
++                        "fallback",
++                        started,
++                        tier=tier_model.tier,
++                        error=type(exc).__name__,
++                    )
++                ],
++            }
++        model = model_name_from(message)
++        return {
++            "reply": message.text,
++            "tier": tier_model.tier,
++            "model": model,
++            "fallback_used": False,
++            "trace": [
++                trace_step(node_name, "generated", started, tier=tier_model.tier, model=model)
++            ],
++        }
++
++    model_reply.__name__ = node_name
++    return model_reply
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/graph/nodes.py day-3/src/trailmate_workflow/graph/nodes.py
+--- day-2/src/trailmate_workflow/graph/nodes.py	2026-11-19 00:23:13
++++ day-3/src/trailmate_workflow/graph/nodes.py	2026-11-19 00:31:39
+@@ -33,27 +33,18 @@
+     }
+ 
+ 
+-async def trail_reply(state: TrailState) -> dict[str, Any]:
+-    started = time.perf_counter()
+-    return {
+-        "reply": templates.TRAIL_REPLY,
+-        "trace": [trace_step("trail_reply", "templated", started)],
+-    }
++# Day 3: trail_reply and general_reply became model-backed nodes (graph/model_nodes.py).
++# Their Day 2 templates live on as the fallbacks used when the model can't be reached.
+ 
+ 
+-async def general_reply(state: TrailState) -> dict[str, Any]:
+-    started = time.perf_counter()
+-    return {
+-        "reply": templates.GENERAL_REPLY,
+-        "trace": [trace_step("general_reply", "templated", started)],
+-    }
+-
+-
+ async def reject_reply(state: TrailState) -> dict[str, Any]:
+     """Out-of-scope requests get a fixed, polite refusal. Never a model."""
+     started = time.perf_counter()
+     return {
+         "reply": templates.render_reject(state["matched_rules"]),
++        "tier": None,
++        "model": None,
++        "fallback_used": False,
+         "trace": [trace_step("reject_reply", "templated", started)],
+     }
+ 
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/graph/state.py day-3/src/trailmate_workflow/graph/state.py
+--- day-2/src/trailmate_workflow/graph/state.py	2026-11-19 00:23:12
++++ day-3/src/trailmate_workflow/graph/state.py	2026-11-19 00:31:39
+@@ -37,6 +37,11 @@
+     category: Category
+     matched_rules: list[str]
+ 
++    # Day 3: set by the reply nodes.
++    tier: str | None  # the tier the app REQUESTED (part of the deterministic routing)
++    model: str | None  # the model that ACTUALLY answered, as reported by the proxy
++    fallback_used: bool  # True when the model call failed and a fixed template was used
++
+ 
+ def trace_step(node: str, outcome: str, started: float, **details: Any) -> TraceStep:
+     """Build a trace step. `started` is the time.perf_counter() value from when the node began."""
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/llm.py day-3/src/trailmate_workflow/llm.py
+--- day-2/src/trailmate_workflow/llm.py	1970-01-01 05:30:00
++++ day-3/src/trailmate_workflow/llm.py	2026-11-19 00:31:05
+@@ -0,0 +1,55 @@
++"""Model clients: one LangChain chat model per TIER, all pointed at the LiteLLM proxy.
++
++The app never names a real model. It asks the proxy for a tier ("fast" or "smart"), and
++litellm/config.yaml decides which Ollama model answers. Swapping models is a config change.
++"""
++
++from dataclasses import dataclass
++
++from langchain_core.language_models import BaseChatModel
++from langchain_core.messages import BaseMessage
++from langchain_openai import ChatOpenAI
++
++from trailmate_workflow.config import Settings
++
++
++@dataclass(frozen=True)
++class TierModel:
++    tier: str  # the tier name, recorded in state and trace (the routing decision)
++    model: BaseChatModel  # anything LangChain-compatible: ChatOpenAI in prod, a fake in tests
++
++
++@dataclass(frozen=True)
++class ReplyModels:
++    trail: TierModel
++    general: TierModel
++
++
++def make_chat_model(tier: str, settings: Settings) -> ChatOpenAI:
++    """A ChatOpenAI client that talks to the LiteLLM proxy and requests `tier` as the model."""
++    return ChatOpenAI(
++        model=tier,
++        base_url=settings.litellm_base_url,
++        api_key=settings.litellm_api_key,
++        timeout=settings.model_timeout_s,
++        max_retries=settings.model_max_retries,
++        max_tokens=settings.model_max_tokens,
++        temperature=settings.model_temperature,
++    )
++
++
++def make_reply_models(settings: Settings) -> ReplyModels:
++    """Build the clients for each model-backed path. No network call happens here."""
++    return ReplyModels(
++        trail=TierModel(settings.trail_tier, make_chat_model(settings.trail_tier, settings)),
++        general=TierModel(settings.general_tier, make_chat_model(settings.general_tier, settings)),
++    )
++
++
++def model_name_from(message: BaseMessage) -> str | None:
++    """The model that ACTUALLY answered, as reported by the server.
++
++    The tier is what we asked for; this is what we got. If LiteLLM falls back from
++    "smart" to "fast", the tier still says "smart" but this reveals the real model.
++    """
++    return message.response_metadata.get("model_name")
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/prompts.py day-3/src/trailmate_workflow/prompts.py
+--- day-2/src/trailmate_workflow/prompts.py	1970-01-01 05:30:00
++++ day-3/src/trailmate_workflow/prompts.py	2026-11-19 00:31:05
+@@ -0,0 +1,21 @@
++"""System prompts for the model-backed paths.
++
++Small local models follow short, concrete instructions best. These prompts only shape the
++TEXT a model writes; they never decide where a request goes (that's the classifier's job).
++"""
++
++TRAIL_SYSTEM_PROMPT = (
++    "You are TrailMate, a friendly hiking assistant. You do NOT have access to a trail "
++    "database yet, so never invent specific trail names, distances, elevation numbers, "
++    "phone numbers, or links. Give practical, general guidance for choosing a hike that fits "
++    "what the person asked for (difficulty, distance, terrain, scenery, safety), then ask "
++    "ONE short clarifying question, such as where they are or how far they want to walk. "
++    "Keep the whole answer under 120 words."
++)
++
++GENERAL_SYSTEM_PROMPT = (
++    "You are TrailMate, a friendly assistant that helps people find hiking trails. Reply in "
++    "one or two short sentences. If the message isn't about hiking, answer briefly and "
++    "kindly steer the conversation back to finding a trail. Never invent specific trail "
++    "names, phone numbers, or links."
++)
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/schemas.py day-3/src/trailmate_workflow/schemas.py
+--- day-2/src/trailmate_workflow/schemas.py	2026-11-19 00:23:12
++++ day-3/src/trailmate_workflow/schemas.py	2026-11-19 00:31:39
+@@ -23,7 +23,10 @@
+ class ChatResponse(BaseModel):
+     request_id: str
+     response: str
+-    route: str | None = None  # which path the graph took; set from Day 2 on
++    route: str | None = None  # which path the graph took
++    tier: str | None = None  # the tier requested for this path (None = no model involved)
++    model: str | None = None  # the model that actually answered
++    fallback_used: bool = False  # the model failed and a fixed template was returned
+     trace: list[TraceStepOut]
+ 
+     @classmethod
+@@ -33,5 +36,8 @@
+             request_id=state["request_id"],
+             response=state["response"],
+             route=state.get("category"),
++            tier=state.get("tier"),
++            model=state.get("model"),
++            fallback_used=state.get("fallback_used", False),
+             trace=state["trace"],
+         )
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/src/trailmate_workflow/templates.py day-3/src/trailmate_workflow/templates.py
+--- day-2/src/trailmate_workflow/templates.py	2026-11-19 00:23:12
++++ day-3/src/trailmate_workflow/templates.py	2026-11-19 00:31:39
+@@ -4,13 +4,14 @@
+ 
+ from trailmate_workflow.classifier import REJECT_TOPICS
+ 
+-TRAIL_REPLY = (
+-    "Sounds like you're looking for a trail! Trail search isn't connected yet, but tell me "
+-    "where you are, how far you'd like to walk, and how hard a hike you want, and I'll "
+-    "remember it for when it is."
++# Day 2 these were the trail/general replies. From Day 3 a model writes those replies, and
++# these templates are the deterministic FALLBACKS used when the model can't be reached.
++TRAIL_FALLBACK_REPLY = (
++    "I can't reach my trail model right now, sorry! In the meantime: tell me where you are, "
++    "how far you'd like to walk, and how hard a hike you want, and try again in a moment."
+ )
+ 
+-GENERAL_REPLY = (
++GENERAL_FALLBACK_REPLY = (
+     "Hi! I'm TrailMate. I help you find hiking trails that fit what you're after: "
+     "distance, difficulty, scenery, or a dog-friendly loop. What are you looking for?"
+ )
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/tests/conftest.py day-3/tests/conftest.py
+--- day-2/tests/conftest.py	2026-11-19 00:18:59
++++ day-3/tests/conftest.py	2026-11-19 00:29:15
+@@ -4,13 +4,13 @@
+ 
+ import httpx
+ import pytest
+-from helpers import client_for
++from helpers import client_for, make_models
+ 
+ from trailmate_workflow.graph.builder import build_graph
+ 
+ 
+ @pytest.fixture
+ async def client() -> AsyncIterator[httpx.AsyncClient]:
+-    """An HTTP client for an app running the default graph."""
+-    async with client_for(build_graph()) as c:
++    """An HTTP client for an app running the real graph with scripted fake models."""
++    async with client_for(build_graph(make_models())) as c:
+         yield c
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/tests/helpers.py day-3/tests/helpers.py
+--- day-2/tests/helpers.py	2026-11-19 00:18:59
++++ day-3/tests/helpers.py	2026-11-19 00:29:15
+@@ -1,12 +1,20 @@
+ """Test helpers shared by several test modules (imported as `from helpers import ...`)."""
+ 
+-from collections.abc import AsyncIterator
++import asyncio
++from collections.abc import AsyncIterator, Iterator
+ from contextlib import asynccontextmanager
++from typing import Any
+ 
+ import httpx
++from langchain_core.language_models import BaseChatModel
++from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
++from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+ from langgraph.graph.state import CompiledStateGraph
++from pydantic import Field
+ 
+ from trailmate_workflow.api import create_app, get_graph
++from trailmate_workflow.graph.state import TraceStep, TrailState
++from trailmate_workflow.llm import ReplyModels, TierModel
+ 
+ 
+ @asynccontextmanager
+@@ -22,3 +30,59 @@
+     transport = httpx.ASGITransport(app=app)
+     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+         yield client
++
++
++class ScriptedChatModel(BaseChatModel):
++    """A fake chat model with a script: it streams fixed `chunks`, and can fail on cue.
++
++    - fail_after=None: never fails.
++    - fail_after=N: streams N chunks, then raises ConnectionError (0 = fails immediately).
++      A non-streaming call (ainvoke) with any fail_after set raises straight away.
++    - seen: every message list it was called with, so tests can check what the model got.
++    """
++
++    chunks: list[str]
++    fail_after: int | None = None
++    seen: list[list[BaseMessage]] = Field(default_factory=list)
++
++    @property
++    def _llm_type(self) -> str:
++        return "scripted"
++
++    def _generate(self, messages: list[BaseMessage], stop=None, run_manager=None, **kwargs: Any):
++        self.seen.append(list(messages))
++        if self.fail_after is not None:
++            raise ConnectionError("proxy unreachable")
++        message = AIMessage(content="".join(self.chunks))
++        return ChatResult(generations=[ChatGeneration(message=message)])
++
++    async def _astream(
++        self, messages: list[BaseMessage], stop=None, run_manager=None, **kwargs: Any
++    ) -> AsyncIterator[ChatGenerationChunk]:
++        self.seen.append(list(messages))
++        for i, text in enumerate(self.chunks):
++            if self.fail_after is not None and i >= self.fail_after:
++                raise ConnectionError("proxy unreachable")
++            await asyncio.sleep(0)  # yield control, like a real network stream would
++            yield ChatGenerationChunk(message=AIMessageChunk(content=text))
++        if self.fail_after is not None and self.fail_after >= len(self.chunks):
++            raise ConnectionError("proxy unreachable")
++
++
++def make_models(
++    trail: BaseChatModel | None = None, general: BaseChatModel | None = None
++) -> ReplyModels:
++    """ReplyModels with scripted fakes on the real tier names ("smart" / "fast")."""
++    return ReplyModels(
++        trail=TierModel("smart", trail or ScriptedChatModel(chunks=["Trail ", "answer."])),
++        general=TierModel("fast", general or ScriptedChatModel(chunks=["Hello ", "hiker!"])),
++    )
++
++
++def step(state: TrailState, node: str) -> TraceStep:
++    """The trace step a given node recorded."""
++    return next(s for s in state["trace"] if s["node"] == node)
++
++
++def steps_named(state: TrailState) -> Iterator[str]:
++    return (s["node"] for s in state["trace"])
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/tests/test_api.py day-3/tests/test_api.py
+--- day-2/tests/test_api.py	2026-11-19 00:22:36
++++ day-3/tests/test_api.py	2026-11-19 00:29:28
+@@ -29,6 +29,13 @@
+     assert (await client.post("/chat", json=payload)).status_code == 422
+ 
+ 
++async def test_chat_reports_tier(client) -> None:
++    body = (await client.post("/chat", json={"message": "easy hike near a lake?"})).json()
++
++    assert body["tier"] == "smart"
++    assert body["fallback_used"] is False
++
++
+ async def test_request_ids_are_unique(client) -> None:
+     a = (await client.post("/chat", json={"message": "a"})).json()["request_id"]
+     b = (await client.post("/chat", json={"message": "b"})).json()["request_id"]
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/tests/test_graph.py day-3/tests/test_graph.py
+--- day-2/tests/test_graph.py	2026-11-19 00:23:13
++++ day-3/tests/test_graph.py	2026-11-19 00:31:39
+@@ -3,6 +3,7 @@
+ import json
+ 
+ import pytest
++from helpers import make_models
+ 
+ from trailmate_workflow import templates
+ from trailmate_workflow.classifier import REJECT_TOPICS
+@@ -19,27 +20,33 @@
+     ],
+ )
+ async def test_each_category_takes_its_own_path(message: str, route: str, reply_node: str) -> None:
+-    state = await build_graph().ainvoke(initial_state("r", message))
++    state = await build_graph(make_models()).ainvoke(initial_state("r", message))
+ 
+     assert state["category"] == route
+     assert [s["node"] for s in state["trace"]] == ["receive", "classify", reply_node, "respond"]
+ 
+ 
+ async def test_reject_reply_names_the_topic() -> None:
+-    state = await build_graph().ainvoke(initial_state("r", "Should I invest in bitcoin?"))
++    state = await build_graph(make_models()).ainvoke(
++        initial_state("r", "Should I invest in bitcoin?")
++    )
+ 
+     assert state["response"] == templates.REJECT_REPLY.format(topic=REJECT_TOPICS["reject:finance"])
+ 
+ 
+ async def test_classify_step_records_the_matched_rules() -> None:
+-    state = await build_graph().ainvoke(initial_state("r", "easy hike near a lake?"))
++    state = await build_graph(make_models()).ainvoke(initial_state("r", "easy hike near a lake?"))
+ 
+     classify_step = next(s for s in state["trace"] if s["node"] == "classify")
+     assert classify_step["outcome"] == "trail"
+     assert classify_step["details"]["rules"] == ["trail:kw:hike", "trail:kw:lake"]
+ 
+ 
+-async def test_trace_never_contains_message_text() -> None:
+-    state = await build_graph().ainvoke(initial_state("req-2", "secret plans for saturday"))
++async def test_trace_never_contains_message_or_reply_text() -> None:
++    state = await build_graph(make_models()).ainvoke(
++        initial_state("req-2", "secret plans for saturday")
++    )
+ 
+-    assert "secret plans" not in json.dumps(state["trace"])
++    trace_json = json.dumps(state["trace"])
++    assert "secret plans" not in trace_json
++    assert state["reply"] not in trace_json
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/tests/test_integration.py day-3/tests/test_integration.py
+--- day-2/tests/test_integration.py	1970-01-01 05:30:00
++++ day-3/tests/test_integration.py	2026-11-19 00:31:39
+@@ -0,0 +1,38 @@
++"""Live tests against the real LiteLLM proxy + Ollama. Skipped unless RUN_INTEGRATION=1.
++
++./scripts/run-proxy.sh            # in another terminal (needs LITELLM_MASTER_KEY in .env)
++RUN_INTEGRATION=1 uv run pytest -m integration -q
++"""
++
++import os
++
++import pytest
++from helpers import client_for
++
++from trailmate_workflow.config import Settings
++from trailmate_workflow.graph.builder import build_graph
++from trailmate_workflow.llm import make_chat_model, make_reply_models
++
++pytestmark = [
++    pytest.mark.integration,
++    pytest.mark.skipif(
++        os.environ.get("RUN_INTEGRATION") != "1",
++        reason="set RUN_INTEGRATION=1 with the LiteLLM proxy and Ollama running",
++    ),
++]
++
++
++@pytest.mark.parametrize("tier", ["fast", "smart"])
++async def test_each_tier_answers(tier: str) -> None:
++    reply = await make_chat_model(tier, Settings()).ainvoke("Say hi in three words.")
++
++    assert reply.text.strip()
++
++
++async def test_trail_message_end_to_end() -> None:
++    async with client_for(build_graph(make_reply_models(Settings()))) as client:
++        body = (await client.post("/chat", json={"message": "easy hike near a lake?"})).json()
++
++    assert body["route"] == "trail"
++    assert body["fallback_used"] is False
++    assert body["model"] is not None
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/tests/test_llm.py day-3/tests/test_llm.py
+--- day-2/tests/test_llm.py	1970-01-01 05:30:00
++++ day-3/tests/test_llm.py	2026-11-19 00:29:16
+@@ -0,0 +1,36 @@
++"""Day 3: how tiers become chat-model clients pointed at the LiteLLM proxy."""
++
++from langchain_core.messages import AIMessage
++
++from trailmate_workflow.config import Settings
++from trailmate_workflow.llm import make_chat_model, make_reply_models, model_name_from
++
++
++def test_make_chat_model_targets_proxy_tier() -> None:
++    model = make_chat_model("smart", Settings(_env_file=None))
++
++    assert model.model_name == "smart"  # the TIER name; LiteLLM maps it to a real model
++    assert model.openai_api_base == "http://127.0.0.1:4000/v1"
++    assert (model.max_tokens, model.max_retries) == (300, 1)
++
++
++def test_paths_map_to_tiers_from_settings() -> None:
++    models = make_reply_models(Settings(_env_file=None, trail_tier="fast", general_tier="smart"))
++
++    assert (models.trail.tier, models.general.tier) == ("fast", "smart")
++
++
++def test_api_key_falls_back_to_master_key(monkeypatch) -> None:
++    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
++    monkeypatch.setenv("LITELLM_MASTER_KEY", "test-key-not-secret")
++
++    model = make_chat_model("fast", Settings(_env_file=None))
++
++    assert model.openai_api_key.get_secret_value() == "test-key-not-secret"
++
++
++def test_model_name_from_reads_metadata() -> None:
++    message = AIMessage("x", response_metadata={"model_name": "ollama_chat/qwen3:4b-instruct"})
++
++    assert model_name_from(message) == "ollama_chat/qwen3:4b-instruct"
++    assert model_name_from(AIMessage("x")) is None
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-2/tests/test_model_nodes.py day-3/tests/test_model_nodes.py
+--- day-2/tests/test_model_nodes.py	1970-01-01 05:30:00
++++ day-3/tests/test_model_nodes.py	2026-11-19 00:31:39
+@@ -0,0 +1,53 @@
++"""Day 3: the trail and general paths call a model (through its tier); reject never does."""
++
++from helpers import ScriptedChatModel, make_models, step
++
++from trailmate_workflow import templates
++from trailmate_workflow.graph.builder import build_graph
++from trailmate_workflow.graph.state import initial_state
++
++
++async def test_trail_path_uses_smart_tier() -> None:
++    state = await build_graph(make_models()).ainvoke(initial_state("r", "easy hike near a lake?"))
++
++    assert (state["reply"], state["tier"], state["fallback_used"]) == (
++        "Trail answer.",
++        "smart",
++        False,
++    )
++    assert step(state, "trail_reply")["outcome"] == "generated"
++
++
++async def test_general_path_uses_fast_tier() -> None:
++    state = await build_graph(make_models()).ainvoke(initial_state("r", "hello"))
++
++    assert (state["reply"], state["tier"]) == ("Hello hiker!", "fast")
++
++
++async def test_model_receives_system_prompt_and_normalized_text() -> None:
++    trail = ScriptedChatModel(chunks=["ok"])
++    await build_graph(make_models(trail=trail)).ainvoke(initial_state("r", "  easy   hike? "))
++
++    system, human = trail.seen[0]
++    assert system.type == "system" and "TrailMate" in system.content
++    assert human.type == "human" and human.content == "easy hike?"
++
++
++async def test_reject_path_calls_no_model() -> None:
++    failing = ScriptedChatModel(chunks=[], fail_after=0)
++    state = await build_graph(make_models(failing, failing)).ainvoke(
++        initial_state("r", "write python code")
++    )
++
++    assert state["tier"] is None and state["fallback_used"] is False
++    assert failing.seen == []
++
++
++async def test_model_failure_falls_back_to_template() -> None:
++    failing = ScriptedChatModel(chunks=[], fail_after=0)
++    state = await build_graph(make_models(trail=failing)).ainvoke(initial_state("r", "easy hike?"))
++
++    assert state["reply"] == templates.TRAIL_FALLBACK_REPLY
++    assert state["fallback_used"] is True
++    assert step(state, "trail_reply")["outcome"] == "fallback"
++    assert step(state, "trail_reply")["details"]["error"] == "ConnectionError"

@@ -1,0 +1,567 @@
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/README.md day-2/README.md
+--- day-1/README.md	2026-11-19 00:20:08
++++ day-2/README.md	2026-11-19 00:23:38
+@@ -2,7 +2,7 @@
+ 
+ TrailMate's Phase 1 workflow service: FastAPI in front of a LangGraph graph whose path is decided by plain code.
+ 
+-> Day 1 state: one fixed path (`receive → process → respond`) with a templated reply.
++> Day 2 state: rule-based classification routes each message down one of three fixed paths (trail / general / reject), each with a templated reply.
+ 
+ ## Quick start
+ 
+@@ -12,11 +12,16 @@
+ uv run uvicorn trailmate_workflow.api:app --host 127.0.0.1 --port 8000
+ ```
+ 
+-In another terminal:
++In another terminal, send one message per path:
+ 
+ ```bash
+-curl -s -X POST 127.0.0.1:8000/chat -H 'content-type: application/json' \
+-  -d '{"message":"hello"}' | jq
++for m in "easy hike with a waterfall?" "hello!" "write me some python code"; do
++  curl -s -X POST 127.0.0.1:8000/chat -H 'content-type: application/json' \
++    -d "{\"message\":\"$m\"}" | jq -c '{route, path: [.trace[].node]}'
++done
++# {"route":"trail","path":["receive","classify","trail_reply","respond"]}
++# {"route":"general","path":["receive","classify","general_reply","respond"]}
++# {"route":"reject","path":["receive","classify","reject_reply","respond"]}
+ ```
+ 
+ ## Endpoints
+@@ -30,11 +35,18 @@
+ 
+ ## Graph
+ 
++Generated from the compiled graph with `uv run trailmate graph`. Dotted arrows are conditional edges, chosen by `route_by_category`.
++
+ ```mermaid
+ graph TD;
+     __start__([__start__]) --> receive;
+-    receive --> process;
+-    process --> respond;
++    receive --> classify;
++    classify -.-> trail_reply;
++    classify -.-> general_reply;
++    classify -.-> reject_reply;
++    trail_reply --> respond;
++    general_reply --> respond;
++    reject_reply --> respond;
+     respond --> __end__([__end__]);
+ ```
+ 
+@@ -44,8 +56,10 @@
+ |---|---|
+ | `src/trailmate_workflow/config.py` | Settings from env / `.env` (pydantic-settings) |
+ | `src/trailmate_workflow/normalize.py` | Unicode/whitespace normalization |
++| `src/trailmate_workflow/classifier.py` | Rule-based classification (reject → trail → general → default) |
+ | `src/trailmate_workflow/templates.py` | Fixed replies |
+-| `src/trailmate_workflow/graph/` | `state.py` (state + trace reducer), `nodes.py`, `builder.py` |
++| `src/trailmate_workflow/graph/` | `state.py` (state + trace reducer), `nodes.py`, `routing.py` (conditional edges), `builder.py` |
++| `src/trailmate_workflow/cli.py` | `uv run trailmate graph` |
+ | `src/trailmate_workflow/schemas.py` | Request/response models |
+ | `src/trailmate_workflow/api.py` | FastAPI app, lifespan, routes |
+ | `tests/` | pytest suite |
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/pyproject.toml day-2/pyproject.toml
+--- day-1/pyproject.toml	2026-11-19 00:18:24
++++ day-2/pyproject.toml	2026-11-19 00:23:12
+@@ -15,6 +15,9 @@
+     "uvicorn[standard]>=0.54.0",
+ ]
+ 
++[project.scripts]
++trailmate = "trailmate_workflow.cli:main"
++
+ [build-system]
+ requires = ["uv_build>=0.13.7,<0.14.0"]
+ build-backend = "uv_build"
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/src/trailmate_workflow/classifier.py day-2/src/trailmate_workflow/classifier.py
+--- day-1/src/trailmate_workflow/classifier.py	1970-01-01 05:30:00
++++ day-2/src/trailmate_workflow/classifier.py	2026-11-19 00:22:17
+@@ -0,0 +1,103 @@
++"""Rule-based message classification: plain code, no model, fully deterministic.
++
++Every rule is data: an id plus a compiled regex. `classify` checks the rule groups in a
++fixed priority order and returns the first group that matches:
++
++    reject  →  trail  →  general  →  default (general)
++
++Reject goes first so the system *fails closed*: a message that mentions a trail but asks
++for something out of scope ("write a Python script to scrape trail data") is rejected.
++A message that matches nothing goes to `general`, which is still a rule, not a guess.
++
++All patterns use word boundaries (\\b), so "hi" matches "hi!" but not "this" or "hiking".
++"""
++
++import re
++from dataclasses import dataclass
++from typing import Literal
++
++Category = Literal["trail", "general", "reject"]
++
++
++@dataclass(frozen=True)
++class Classification:
++    category: Category
++    matched_rules: tuple[str, ...]  # rule ids, e.g. ("trail:kw:hike", "trail:kw:lake")
++
++
++def _rule(pattern: str) -> re.Pattern[str]:
++    return re.compile(pattern, re.IGNORECASE)
++
++
++# Out-of-scope requests: "we don't do that here". (Safety blocking is a separate job: the
++# Day 5 input guardrail.) Kept deliberately narrow, to avoid rejecting real hiking questions
++# like "what's the function of trekking poles?" or "is there a dress code at the lodge?".
++REJECT_RULES: dict[str, re.Pattern[str]] = {
++    "reject:code": _rule(
++        r"\b(?:write|writing|debug|fix|generate|refactor)\b.{0,40}"
++        r"\b(?:code|script|program|function|regex|sql)\b"
++        r"|\b(?:python|javascript|typescript|java|sql)\s+(?:code|script|program|function)\b"
++        r"|\b(?:coding|programming)\b"
++    ),
++    "reject:homework": _rule(r"\b(?:homework|essay|assignment|thesis)\b"),
++    "reject:finance": _rule(
++        r"\b(?:invest|investing|investment|stocks?|crypto|bitcoin|trading|forex)\b"
++    ),
++    "reject:medical": _rule(r"\b(?:diagnose|diagnosis|prescription|prescribe|dosage|medication)\b"),
++    "reject:legal": _rule(r"\b(?:lawsuit|sue|lawyer|attorney|legal advice)\b"),
++    "reject:realtime": _rule(r"\b(?:weather|forecast|news|headlines)\b"),
++    "reject:harmful": _rule(r"\b(?:bomb|explosives?|weapons?|firearms?|poison)\b"),
++}
++
++# Shown to the user by the reject reply: "...so I can't help with <topic>."
++REJECT_TOPICS: dict[str, str] = {
++    "reject:code": "writing or debugging code",
++    "reject:homework": "homework or essays",
++    "reject:finance": "financial or investment advice",
++    "reject:medical": "medical advice",
++    "reject:legal": "legal advice",
++    "reject:realtime": "live weather, news, or other real-time information",
++    "reject:harmful": "anything that could cause harm",
++}
++
++# Hiking vocabulary. Each keyword is its own rule, so the trace shows exactly which words
++# decided the route.
++TRAIL_KEYWORDS = (
++    "hike", "hikes", "hiking", "hiker", "hikers",
++    "trail", "trails", "trailhead", "trek", "trekking", "backpacking",
++    "summit", "peak", "ridge", "loop", "switchbacks", "elevation", "miles", "km",
++    "waterfall", "lake", "canyon", "national park", "dog-friendly",
++    "difficulty", "scenic", "campsite", "camping",
++)  # fmt: skip
++TRAIL_RULES: dict[str, re.Pattern[str]] = {
++    f"trail:kw:{kw}": _rule(rf"\b{re.escape(kw)}\b") for kw in TRAIL_KEYWORDS
++}
++
++GENERAL_RULES: dict[str, re.Pattern[str]] = {
++    "general:greeting": _rule(
++        r"\b(?:hi|hello|hey|howdy|hiya|good (?:morning|afternoon|evening))\b"
++    ),
++    "general:thanks": _rule(r"\b(?:thanks|thank you|thx|cheers)\b"),
++    "general:goodbye": _rule(r"\b(?:bye|goodbye|see you|see ya)\b"),
++    "general:about": _rule(r"\b(?:who are you|what are you|your name)\b"),
++    "general:help": _rule(r"\b(?:what can you do|help|how does this work)\b"),
++    "general:smalltalk": _rule(r"\b(?:how are you|how's it going|what's up)\b"),
++}
++
++# The priority order IS the routing policy. Change it here, and only here.
++_RULE_GROUPS: tuple[tuple[Category, dict[str, re.Pattern[str]]], ...] = (
++    ("reject", REJECT_RULES),
++    ("trail", TRAIL_RULES),
++    ("general", GENERAL_RULES),
++)
++
++DEFAULT = Classification("general", ("general:default",))
++
++
++def classify(text: str) -> Classification:
++    """Return the first rule group (in priority order) with any matching rule."""
++    for category, rules in _RULE_GROUPS:
++        matched = tuple(rule_id for rule_id, pattern in rules.items() if pattern.search(text))
++        if matched:
++            return Classification(category, matched)
++    return DEFAULT
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/src/trailmate_workflow/cli.py day-2/src/trailmate_workflow/cli.py
+--- day-1/src/trailmate_workflow/cli.py	1970-01-01 05:30:00
++++ day-2/src/trailmate_workflow/cli.py	2026-11-19 00:23:13
+@@ -0,0 +1,25 @@
++"""The `trailmate` command-line tool.
++
++uv run trailmate graph     # print the workflow as a Mermaid diagram
++"""
++
++import argparse
++
++from trailmate_workflow.graph.builder import build_graph
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(prog="trailmate", description="TrailMate workflow tools")
++    commands = parser.add_subparsers(dest="command", required=True)
++    commands.add_parser("graph", help="print the workflow graph as Mermaid text")
++
++    args = parser.parse_args(argv)
++    if args.command == "graph":
++        # draw_mermaid() is pure text, computed locally. (draw_mermaid_png() would call an
++        # external web API, so it's deliberately not used.)
++        print(build_graph().get_graph().draw_mermaid())
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/src/trailmate_workflow/graph/builder.py day-2/src/trailmate_workflow/graph/builder.py
+--- day-1/src/trailmate_workflow/graph/builder.py	2026-11-19 00:18:16
++++ day-2/src/trailmate_workflow/graph/builder.py	2026-11-19 00:23:12
+@@ -4,22 +4,30 @@
+ from langgraph.graph.state import CompiledStateGraph
+ 
+ from trailmate_workflow.graph import nodes
++from trailmate_workflow.graph.routing import route_by_category
+ from trailmate_workflow.graph.state import TrailState
+ 
++REPLY_NODES = ("trail_reply", "general_reply", "reject_reply")
+ 
++
+ def build_graph() -> CompiledStateGraph:
+-    """Day 1: one fixed path, START → receive → process → respond → END."""
++    """START → receive → classify →(route_by_category)→ one reply node → respond → END."""
+     graph = StateGraph(TrailState)
+ 
+     graph.add_node("receive", nodes.receive)
+-    graph.add_node("process", nodes.process)
++    graph.add_node("classify", nodes.classify)
++    graph.add_node("trail_reply", nodes.trail_reply)
++    graph.add_node("general_reply", nodes.general_reply)
++    graph.add_node("reject_reply", nodes.reject_reply)
+     graph.add_node("respond", nodes.respond)
+ 
+     graph.add_edge(START, "receive")
+-    graph.add_edge("receive", "process")
+-    graph.add_edge("process", "respond")
++    graph.add_edge("receive", "classify")
++    # A conditional edge: after `classify`, call route_by_category(state) and go to the
++    # node whose name it returns. The list is the set of allowed destinations.
++    graph.add_conditional_edges("classify", route_by_category, list(REPLY_NODES))
++    for reply_node in REPLY_NODES:
++        graph.add_edge(reply_node, "respond")
+     graph.add_edge("respond", END)
+ 
+-    # compile() validates the wiring (no dangling nodes, a reachable END) and returns a
+-    # runnable with .invoke/.ainvoke/.stream/.astream.
+     return graph.compile()
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/src/trailmate_workflow/graph/nodes.py day-2/src/trailmate_workflow/graph/nodes.py
+--- day-1/src/trailmate_workflow/graph/nodes.py	2026-11-19 00:18:16
++++ day-2/src/trailmate_workflow/graph/nodes.py	2026-11-19 00:23:13
+@@ -9,6 +9,7 @@
+ from typing import Any
+ 
+ from trailmate_workflow import templates
++from trailmate_workflow.classifier import classify as classify_text
+ from trailmate_workflow.graph.state import TrailState, trace_step
+ from trailmate_workflow.normalize import normalize_text
+ 
+@@ -20,12 +21,40 @@
+     return {"text": text, "trace": [trace_step("receive", "normalized", started, chars=len(text))]}
+ 
+ 
+-async def process(state: TrailState) -> dict[str, Any]:
+-    """Processing node (Day 1): a fixed, templated reply with no model involved."""
++async def classify(state: TrailState) -> dict[str, Any]:
++    """Decide the category with plain rules. The routing function reads `category` next."""
+     started = time.perf_counter()
++    result = classify_text(state["text"])
++    rules = list(result.matched_rules)
+     return {
+-        "reply": templates.PROCESS_REPLY,
+-        "trace": [trace_step("process", "templated", started)],
++        "category": result.category,
++        "matched_rules": rules,
++        "trace": [trace_step("classify", result.category, started, rules=rules)],
++    }
++
++
++async def trail_reply(state: TrailState) -> dict[str, Any]:
++    started = time.perf_counter()
++    return {
++        "reply": templates.TRAIL_REPLY,
++        "trace": [trace_step("trail_reply", "templated", started)],
++    }
++
++
++async def general_reply(state: TrailState) -> dict[str, Any]:
++    started = time.perf_counter()
++    return {
++        "reply": templates.GENERAL_REPLY,
++        "trace": [trace_step("general_reply", "templated", started)],
++    }
++
++
++async def reject_reply(state: TrailState) -> dict[str, Any]:
++    """Out-of-scope requests get a fixed, polite refusal. Never a model."""
++    started = time.perf_counter()
++    return {
++        "reply": templates.render_reject(state["matched_rules"]),
++        "trace": [trace_step("reject_reply", "templated", started)],
+     }
+ 
+ 
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/src/trailmate_workflow/graph/routing.py day-2/src/trailmate_workflow/graph/routing.py
+--- day-1/src/trailmate_workflow/graph/routing.py	1970-01-01 05:30:00
++++ day-2/src/trailmate_workflow/graph/routing.py	2026-11-19 00:23:12
+@@ -0,0 +1,23 @@
++"""Routing functions for conditional edges.
++
++A routing function reads the state and returns the NAME of the next node. It's ordinary
++code: no model decides where a request goes. The `Literal[...]` return type lists every
++possible destination, so LangGraph can validate the edges and draw the branches.
++"""
++
++from typing import Literal
++
++from trailmate_workflow.graph.state import TrailState
++
++ReplyNode = Literal["trail_reply", "general_reply", "reject_reply"]
++
++_REPLY_NODE_FOR: dict[str, ReplyNode] = {
++    "trail": "trail_reply",
++    "general": "general_reply",
++    "reject": "reject_reply",
++}
++
++
++def route_by_category(state: TrailState) -> ReplyNode:
++    """classify → one reply node per category."""
++    return _REPLY_NODE_FOR[state["category"]]
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/src/trailmate_workflow/graph/state.py day-2/src/trailmate_workflow/graph/state.py
+--- day-1/src/trailmate_workflow/graph/state.py	2026-11-19 00:18:16
++++ day-2/src/trailmate_workflow/graph/state.py	2026-11-19 00:23:12
+@@ -4,7 +4,9 @@
+ import time
+ from typing import Annotated, Any, TypedDict
+ 
++from trailmate_workflow.classifier import Category
+ 
++
+ class TraceStep(TypedDict):
+     """One entry in a run's trace. Metadata only, never user text or model text."""
+ 
+@@ -30,6 +32,10 @@
+     # Annotated[list, operator.add], LangGraph instead combines old + new, so when a node
+     # returns {"trace": [step]} its step is APPENDED. That is how every node adds its own entry.
+     trace: Annotated[list[TraceStep], operator.add]
++
++    # Day 2: set by the `classify` node and read by the routing function.
++    category: Category
++    matched_rules: list[str]
+ 
+ 
+ def trace_step(node: str, outcome: str, started: float, **details: Any) -> TraceStep:
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/src/trailmate_workflow/schemas.py day-2/src/trailmate_workflow/schemas.py
+--- day-1/src/trailmate_workflow/schemas.py	2026-11-19 00:19:14
++++ day-2/src/trailmate_workflow/schemas.py	2026-11-19 00:23:12
+@@ -32,5 +32,6 @@
+         return cls(
+             request_id=state["request_id"],
+             response=state["response"],
++            route=state.get("category"),
+             trace=state["trace"],
+         )
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/src/trailmate_workflow/templates.py day-2/src/trailmate_workflow/templates.py
+--- day-1/src/trailmate_workflow/templates.py	2026-11-19 00:18:16
++++ day-2/src/trailmate_workflow/templates.py	2026-11-19 00:23:12
+@@ -1,6 +1,26 @@
+ """Fixed (templated) replies. No model produces any of the text in this module."""
+ 
+-PROCESS_REPLY = (
+-    "Thanks, TrailMate got your message! Trail suggestions are coming soon. "
+-    "For now, this reply shows that your message flowed through the whole workflow."
++from collections.abc import Sequence
++
++from trailmate_workflow.classifier import REJECT_TOPICS
++
++TRAIL_REPLY = (
++    "Sounds like you're looking for a trail! Trail search isn't connected yet, but tell me "
++    "where you are, how far you'd like to walk, and how hard a hike you want, and I'll "
++    "remember it for when it is."
+ )
++
++GENERAL_REPLY = (
++    "Hi! I'm TrailMate. I help you find hiking trails that fit what you're after: "
++    "distance, difficulty, scenery, or a dog-friendly loop. What are you looking for?"
++)
++
++REJECT_REPLY = (
++    "Sorry, I can only help with hiking and trail questions, so I can't help with {topic}. "
++    "Try asking me about a hike: distance, difficulty, or scenery."
++)
++
++
++def render_reject(matched_rules: Sequence[str]) -> str:
++    """The reject reply, naming the topic of the first reject rule that matched."""
++    return REJECT_REPLY.format(topic=REJECT_TOPICS[matched_rules[0]])
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/tests/test_api.py day-2/tests/test_api.py
+--- day-1/tests/test_api.py	2026-11-19 00:18:59
++++ day-2/tests/test_api.py	2026-11-19 00:22:36
+@@ -7,13 +7,21 @@
+     assert (await client.get("/health")).json() == {"status": "ok"}
+ 
+ 
+-async def test_chat_returns_templated_reply_and_trace(client) -> None:
+-    r = await client.post("/chat", json={"message": "Find me a hike"})
++@pytest.mark.parametrize(
++    ("message", "route"),
++    [
++        ("Recommend a hike with a waterfall", "trail"),
++        ("hello!", "general"),
++        ("Write a python script for me", "reject"),
++    ],
++)
++async def test_chat_route_matches_category(client, message: str, route: str) -> None:
++    r = await client.post("/chat", json={"message": message})
+ 
+     assert r.status_code == 200
+     body = r.json()
++    assert body["route"] == route
+     assert body["response"] and body["request_id"]
+-    assert [s["node"] for s in body["trace"]] == ["receive", "process", "respond"]
+ 
+ 
+ @pytest.mark.parametrize("payload", [{"message": ""}, {}, {"message": "x" * 10_001}])
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/tests/test_classifier.py day-2/tests/test_classifier.py
+--- day-1/tests/test_classifier.py	1970-01-01 05:30:00
++++ day-2/tests/test_classifier.py	2026-11-19 00:22:17
+@@ -0,0 +1,66 @@
++"""Table-driven tests for the rule-based classifier: every row pins one routing decision."""
++
++import pytest
++
++from trailmate_workflow.classifier import REJECT_TOPICS, Classification, classify
++
++CASES = [  # (text, expected category, rule ids that must be among matched_rules)
++    (
++        "Can you recommend an easy hike with a waterfall?",
++        "trail",
++        {"trail:kw:hike", "trail:kw:waterfall"},
++    ),
++    ("Is the Mist Trail dog-friendly?", "trail", {"trail:kw:trail", "trail:kw:dog-friendly"}),
++    ("How many miles is the loop?", "trail", {"trail:kw:miles", "trail:kw:loop"}),
++    ("Hiking?!", "trail", {"trail:kw:hiking"}),  # punctuation glued to the keyword
++    ("Any trails near Zürich? ☕", "trail", {"trail:kw:trails"}),  # accents + emoji
++    ("TRAIL.", "trail", {"trail:kw:trail"}),  # case-insensitive
++    ("hi", "general", {"general:greeting"}),
++    ("Hello there!", "general", {"general:greeting"}),
++    ("thanks so much", "general", {"general:thanks"}),
++    ("who are you?", "general", {"general:about"}),
++    ("what can you do", "general", {"general:help"}),
++    # Reject rules run FIRST, so they win even when trail words are present.
++    ("Write a Python script to scrape trail data", "reject", {"reject:code"}),
++    ("What's the weather on the summit tomorrow?", "reject", {"reject:realtime"}),
++    ("Should I invest in bitcoin?", "reject", {"reject:finance"}),
++    ("Can you do my homework essay?", "reject", {"reject:homework"}),
++    ("Can you diagnose my rash?", "reject", {"reject:medical"}),
++    ("Help me draft a lawsuit", "reject", {"reject:legal"}),
++    ("How do I make a bomb?", "reject", {"reject:harmful"}),
++]
++
++
++@pytest.mark.parametrize(("text", "category", "rules"), CASES)
++def test_classify(text: str, category: str, rules: set[str]) -> None:
++    result = classify(text)
++
++    assert result.category == category
++    assert rules <= set(result.matched_rules)
++    # matched_rules only ever lists rules of the winning category
++    assert all(rule.startswith(category) for rule in result.matched_rules)
++
++
++@pytest.mark.parametrize(
++    "text",
++    [
++        "this is nice",  # "hi" inside "this" must NOT count as a greeting (word boundaries)
++        "What's the capital of France?",
++        "👍",
++        "",
++    ],
++)
++def test_unmatched_defaults_to_general(text: str) -> None:
++    assert classify(text) == Classification("general", ("general:default",))
++
++
++def test_every_reject_rule_has_a_topic() -> None:
++    assert set(REJECT_TOPICS) == {
++        "reject:code",
++        "reject:homework",
++        "reject:finance",
++        "reject:medical",
++        "reject:legal",
++        "reject:realtime",
++        "reject:harmful",
++    }
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/tests/test_cli.py day-2/tests/test_cli.py
+--- day-1/tests/test_cli.py	1970-01-01 05:30:00
++++ day-2/tests/test_cli.py	2026-11-19 00:22:36
+@@ -0,0 +1,10 @@
++"""Tests for the `trailmate` command-line tool."""
++
++from trailmate_workflow.cli import main
++
++
++def test_cli_graph_prints_mermaid(capsys) -> None:
++    assert main(["graph"]) == 0
++
++    out = capsys.readouterr().out
++    assert "classify" in out and "reject_reply" in out
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-1/tests/test_graph.py day-2/tests/test_graph.py
+--- day-1/tests/test_graph.py	2026-11-19 00:17:28
++++ day-2/tests/test_graph.py	2026-11-19 00:23:13
+@@ -2,18 +2,41 @@
+ 
+ import json
+ 
++import pytest
++
+ from trailmate_workflow import templates
++from trailmate_workflow.classifier import REJECT_TOPICS
+ from trailmate_workflow.graph.builder import build_graph
+ from trailmate_workflow.graph.state import initial_state
+ 
+ 
+-async def test_day1_graph_runs_receive_process_respond() -> None:
+-    state = await build_graph().ainvoke(initial_state("req-1", "  Hello   TrailMate "))
++@pytest.mark.parametrize(
++    ("message", "route", "reply_node"),
++    [
++        ("Recommend a hike with a waterfall", "trail", "trail_reply"),
++        ("hello!", "general", "general_reply"),
++        ("Write a python script for me", "reject", "reject_reply"),
++    ],
++)
++async def test_each_category_takes_its_own_path(message: str, route: str, reply_node: str) -> None:
++    state = await build_graph().ainvoke(initial_state("r", message))
+ 
+-    assert state["text"] == "Hello TrailMate"
+-    assert state["response"] == state["reply"] == templates.PROCESS_REPLY
+-    assert [s["node"] for s in state["trace"]] == ["receive", "process", "respond"]
+-    assert all(s["duration_ms"] >= 0 for s in state["trace"])
++    assert state["category"] == route
++    assert [s["node"] for s in state["trace"]] == ["receive", "classify", reply_node, "respond"]
++
++
++async def test_reject_reply_names_the_topic() -> None:
++    state = await build_graph().ainvoke(initial_state("r", "Should I invest in bitcoin?"))
++
++    assert state["response"] == templates.REJECT_REPLY.format(topic=REJECT_TOPICS["reject:finance"])
++
++
++async def test_classify_step_records_the_matched_rules() -> None:
++    state = await build_graph().ainvoke(initial_state("r", "easy hike near a lake?"))
++
++    classify_step = next(s for s in state["trace"] if s["node"] == "classify")
++    assert classify_step["outcome"] == "trail"
++    assert classify_step["details"]["rules"] == ["trail:kw:hike", "trail:kw:lake"]
+ 
+ 
+ async def test_trace_never_contains_message_text() -> None:

@@ -1,0 +1,30 @@
+# LiteLLM proxy config: named model TIERS in front of local Ollama models.
+#
+# The app only ever asks for "fast" or "smart". Which real model sits behind a tier is
+# decided HERE, so swapping models never touches application code.
+#
+# Start the proxy with:  ./scripts/run-proxy.sh   (serves http://127.0.0.1:4000)
+
+model_list:
+  - model_name: fast                       # tier name the app requests
+    litellm_params:
+      model: ollama_chat/llama3.2:1b       # ollama_chat/ → Ollama's /api/chat (not ollama/ → /api/generate)
+      api_base: http://127.0.0.1:11434
+      keep_alive: 30m                      # keep the model in memory (default 5m → cold starts)
+  - model_name: smart
+    litellm_params:
+      model: ollama_chat/qwen3:4b-instruct # non-thinking Qwen3-4B-Instruct-2507 (NOT plain qwen3:4b)
+      api_base: http://127.0.0.1:11434
+      keep_alive: 30m
+
+litellm_settings:
+  request_timeout: 60                      # seconds per model call
+  num_retries: 1
+
+router_settings:
+  fallbacks: [{"smart": ["fast"]}]         # if "smart" fails, LiteLLM retries the call on "fast"
+
+general_settings:
+  # Optional locally. When LITELLM_MASTER_KEY is set (see .env.example), every request
+  # must send "Authorization: Bearer <key>". The value is never written in this file.
+  master_key: os.environ/LITELLM_MASTER_KEY

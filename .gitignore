@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Local secrets and noise. Never commit .env
+.env
+*.log
+.DS_Store
+.idea/

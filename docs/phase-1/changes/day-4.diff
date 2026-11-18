@@ -1,0 +1,786 @@
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/README.md day-4/README.md
+--- day-3/README.md	2026-11-19 00:32:24
++++ day-4/README.md	2026-11-19 00:37:35
+@@ -2,7 +2,7 @@
+ 
+ TrailMate's Phase 1 workflow service: FastAPI in front of a LangGraph graph whose path is decided by plain code. A local model, reached through LiteLLM tiers, writes only the text.
+ 
+-> Day 3 state: trail questions are answered by the `smart` tier and chit-chat by the `fast` tier, both through the LiteLLM proxy to local Ollama models. Reject stays a fixed template. If the model can't be reached, the path falls back to a fixed reply.
++> Day 4 state: trail questions are answered by the `smart` tier and chit-chat by the `fast` tier, both through the LiteLLM proxy to local Ollama models. Reject stays a fixed template, and a fallback reply is used if the model can't be reached. Replies stream back over SSE (`POST /chat/stream`).
+ 
+ ## Run it
+ 
+@@ -29,21 +29,56 @@
+ ### 3. Try it
+ 
+ ```bash
+-for m in "easy hike near a lake?" "hello!" "write me some python code"; do
+-  curl -s -X POST 127.0.0.1:8000/chat -H 'content-type: application/json' \
+-    -d "{\"message\":\"$m\"}" | jq -c '{route, tier, model, fallback_used, response}'
+-done
++uv run trailmate chat "easy hike near a lake?"     # streams: steps, then the reply word by word
++uv run trailmate chat "hello!"                     # fast tier
++uv run trailmate chat "write me some python code"  # reject: one fixed reply, no model
++uv run trailmate chat --raw "hello!"               # the raw SSE wire format
++
++curl -N -X POST 127.0.0.1:8000/chat/stream -H 'content-type: application/json' \
++  -d '{"message":"easy hike near a lake?"}'        # -N: print events as they arrive
++
++curl -s -X POST 127.0.0.1:8000/chat -H 'content-type: application/json' \
++  -d '{"message":"hello!"}' | jq                   # the same graph, as one JSON response
+ ```
+ 
++Example (`trailmate chat`, real output):
++
++```text
++→ request 551a96d1301b48e3bbb6c8c5b6eee529
++✓ receive          normalized chars=22  (0.01 ms)
++✓ classify         trail      rules=trail:kw:hike,trail:kw:lake  (0.02 ms)
++  │ Great choice! An easy lake hike is perfect for a relaxed day outdoors. Look for a short, flat trail …
++    Where are you planning to hike? (This helps match a good option!)
++✓ trail_reply      generated  tier=smart model=…  (1726.89 ms)
++✓ respond          responded    (0.0 ms)
++── route=trail tier=smart model=… fallback=False blocked=False
++```
++
+ ## Endpoints
+ 
+ | Method and path | Body | Returns |
+ |---|---|---|
+ | `GET /health` | — | `{"status": "ok"}` |
+ | `POST /chat` | `{"message": "..."}` (1–10,000 chars) | `{request_id, response, route, tier, model, fallback_used, trace}` |
++| `POST /chat/stream` | same | `text/event-stream`: the events below |
+ 
+ Interactive docs: http://127.0.0.1:8000/docs
+ 
++### SSE events (`/chat/stream`)
++
++Every `data:` is JSON.
++
++| Event | When | Payload |
++|---|---|---|
++| `start` | first | `{request_id}` |
++| `step` | each node finishes | `{node, outcome, details, duration_ms}`. Metadata only, never reply text. |
++| `token` | reply text | `{text}`. Many for model paths, **exactly one** for templated paths. |
++| `retract` | text already sent must be replaced | `{reason, replacement}`. Discard every `token` so far and show `replacement`. |
++| `done` | last | Same fields as the `/chat` JSON. **`response` is authoritative.** |
++| `error` | unexpected failure | `{message}` (generic), then the stream ends |
++
++sse-starlette also sends a keep-alive comment (`: ping`) every 15 s. If the client disconnects, the graph run and the model call are cancelled.
++
+ ## Configuration (env vars or `.env`)
+ 
+ | Variable | Default | Meaning |
+@@ -83,9 +118,11 @@
+ | `src/trailmate_workflow/classifier.py` | Rule-based classification (reject → trail → general → default) |
+ | `src/trailmate_workflow/llm.py` | Tier → `ChatOpenAI` client pointed at the proxy |
+ | `src/trailmate_workflow/prompts.py`, `templates.py` | System prompts; fixed replies and fallbacks |
+-| `src/trailmate_workflow/graph/` | `state.py`, `nodes.py`, `model_nodes.py`, `routing.py`, `builder.py` |
+-| `src/trailmate_workflow/schemas.py`, `api.py` | HTTP contract and FastAPI app |
+-| `src/trailmate_workflow/cli.py` | `uv run trailmate graph` |
++| `src/trailmate_workflow/graph/` | `state.py`, `nodes.py`, `model_nodes.py`, `events.py` (custom stream), `routing.py`, `builder.py` |
++| `src/trailmate_workflow/streaming.py` | Graph stream (`updates` + `custom` + `values`, v2) → SSE events |
++| `src/trailmate_workflow/sse.py` | SSE parser used by the CLI and the tests |
++| `src/trailmate_workflow/schemas.py`, `api.py`, `observability.py` | HTTP contract, FastAPI app, request log line |
++| `src/trailmate_workflow/cli.py` | `uv run trailmate graph` / `uv run trailmate chat` |
+ | `litellm/config.yaml` | Tier → Ollama model mapping, fallback, timeouts |
+ | `scripts/` | `pull-models.sh`, `run-proxy.sh`, `warm-up.sh` |
+ | `tests/` | pytest suite (fake models; no Ollama needed) |
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/pyproject.toml day-4/pyproject.toml
+--- day-3/pyproject.toml	2026-11-19 00:29:28
++++ day-4/pyproject.toml	2026-11-19 00:36:14
+@@ -9,10 +9,12 @@
+ requires-python = ">=3.14"
+ dependencies = [
+     "fastapi>=0.164.0",
++    "httpx>=0.28.1",
+     "langchain-core>=1.8.3",
+     "langchain-openai>=1.8.2",
+     "langgraph>=1.2.22",
+     "pydantic-settings>=2.16.3",
++    "sse-starlette>=3.7.0",
+     "uvicorn[standard]>=0.54.0",
+ ]
+ 
+@@ -25,7 +27,6 @@
+ 
+ [dependency-groups]
+ dev = [
+-    "httpx>=0.28.1",
+     "pytest>=9.2.0",
+     "pytest-asyncio>=1.5.0",
+     "ruff>=0.17.5",
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/src/trailmate_workflow/api.py day-4/src/trailmate_workflow/api.py
+--- day-3/src/trailmate_workflow/api.py	2026-11-19 00:31:39
++++ day-4/src/trailmate_workflow/api.py	2026-11-19 00:35:34
+@@ -12,16 +12,17 @@
+ 
+ from fastapi import Depends, FastAPI, Request
+ from langgraph.graph.state import CompiledStateGraph
++from sse_starlette import EventSourceResponse
+ 
+ from trailmate_workflow.config import Settings, get_settings
+ from trailmate_workflow.graph.builder import build_graph
+ from trailmate_workflow.graph.state import initial_state
+ from trailmate_workflow.llm import make_reply_models
++from trailmate_workflow.observability import log_request
+ from trailmate_workflow.schemas import ChatRequest, ChatResponse
++from trailmate_workflow.streaming import chat_events
+ 
+-logger = logging.getLogger("trailmate")
+ 
+-
+ def get_graph(request: Request) -> CompiledStateGraph:
+     """Dependency: the graph compiled once at startup. Tests override this."""
+     return request.app.state.graph
+@@ -58,21 +59,17 @@
+         log_request(response, started)
+         return response
+ 
+-    return app
++    @app.post("/chat/stream")
++    async def chat_stream(body: ChatRequest, graph: GraphDep) -> EventSourceResponse:
++        """Same graph, streamed as Server-Sent Events: start, step…, token…, done.
+ 
++        sse-starlette sends a keep-alive comment every 15 s and cancels the generator
++        (and so the graph run and the model call) when the client disconnects.
++        """
++        request_id = uuid.uuid4().hex
++        return EventSourceResponse(chat_events(graph, request_id, body.message), ping=15)
+ 
+-def log_request(response: ChatResponse, started: float) -> None:
+-    """One metadata-only log line per request: never the message or reply text."""
+-    logger.info(
+-        "request_id=%s route=%s tier=%s model=%s fallback=%s nodes=%s total_ms=%.1f",
+-        response.request_id,
+-        response.route,
+-        response.tier,
+-        response.model,
+-        response.fallback_used,
+-        ",".join(step.node for step in response.trace),
+-        (time.perf_counter() - started) * 1000,
+-    )
++    return app
+ 
+ 
+ app = create_app()
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/src/trailmate_workflow/cli.py day-4/src/trailmate_workflow/cli.py
+--- day-3/src/trailmate_workflow/cli.py	2026-11-19 00:31:39
++++ day-4/src/trailmate_workflow/cli.py	2026-11-19 00:36:31
+@@ -1,19 +1,113 @@
+ """The `trailmate` command-line tool.
+ 
+-uv run trailmate graph     # print the workflow as a Mermaid diagram
++uv run trailmate graph                          # print the workflow as a Mermaid diagram
++uv run trailmate chat "easy hike near a lake?"  # stream a reply, showing every step
++uv run trailmate chat --raw "hello"             # show the raw SSE wire format instead
+ """
+ 
+ import argparse
++import sys
++from typing import Any, TextIO
+ 
++import httpx
++
+ from trailmate_workflow.config import get_settings
+ from trailmate_workflow.graph.builder import build_graph
+ from trailmate_workflow.llm import make_reply_models
++from trailmate_workflow.sse import SSEEvent, parse_sse
+ 
++DEFAULT_URL = "http://127.0.0.1:8000"
+ 
++
++def _details(details: dict[str, Any]) -> str:
++    """Compact `key=value` rendering of a step's metadata."""
++    parts = []
++    for key, value in details.items():
++        if isinstance(value, list):
++            value = ",".join(map(str, value)) or "-"
++        parts.append(f"{key}={value}")
++    return " ".join(parts)
++
++
++class EventPrinter:
++    """Prints SSE events for a human: steps on their own lines, reply tokens inline."""
++
++    def __init__(self, out: TextIO) -> None:
++        self.out = out
++        self.in_reply = False  # are we partway through a line of reply text?
++
++    def _line(self, text: str) -> None:
++        if self.in_reply:  # finish the reply line before printing anything else
++            self.out.write("\n")
++            self.in_reply = False
++        self.out.write(text + "\n")
++        self.out.flush()
++
++    def __call__(self, event: SSEEvent) -> None:
++        data = event.data
++        if event.event == "start":
++            self._line(f"→ request {data['request_id']}")
++        elif event.event == "step":
++            info = _details(data.get("details", {}))
++            self._line(
++                f"✓ {data['node']:<16} {data['outcome']:<10} {info}  ({data['duration_ms']} ms)"
++            )
++        elif event.event == "token":
++            if not self.in_reply:
++                self.out.write("  │ ")
++                self.in_reply = True
++            self.out.write(data["text"])  # inline, exactly as it arrives
++            self.out.flush()
++        elif event.event == "retract":
++            self._line(f"⟲ replaced ({data['reason']}): {data['replacement']}")
++        elif event.event == "done":
++            self._line(
++                f"── route={data.get('route')} tier={data.get('tier')} model={data.get('model')} "
++                f"fallback={data.get('fallback_used')} blocked={data.get('blocked', False)}"
++            )
++        elif event.event == "error":
++            self._line(f"✗ {data['message']}")
++
++
++def chat(message: str, url: str, raw: bool, out: TextIO) -> int:
++    """POST the message to /chat/stream and print events as they arrive."""
++    printer = EventPrinter(out)
++    timeout = httpx.Timeout(10.0, read=None)  # replies stream for a while; pings keep it alive
++    try:
++        with httpx.stream(
++            "POST", f"{url}/chat/stream", json={"message": message}, timeout=timeout
++        ) as response:
++            if response.status_code != 200:
++                out.write(f"✗ HTTP {response.status_code}: {response.read().decode()[:300]}\n")
++                return 1
++            if raw:
++                for line in response.iter_lines():
++                    out.write(line + "\n")
++                    out.flush()
++                return 0
++            finished = False
++            for event in parse_sse(response.iter_lines()):
++                printer(event)
++                finished = finished or event.event == "done"
++            return 0 if finished else 1
++    except httpx.ConnectError:
++        out.write(
++            f"✗ API not reachable at {url}. Start it with: "
++            "uv run uvicorn trailmate_workflow.api:app --host 127.0.0.1 --port 8000\n"
++        )
++        return 1
++
++
+ def main(argv: list[str] | None = None) -> int:
+     parser = argparse.ArgumentParser(prog="trailmate", description="TrailMate workflow tools")
+     commands = parser.add_subparsers(dest="command", required=True)
+     commands.add_parser("graph", help="print the workflow graph as Mermaid text")
++    chat_cmd = commands.add_parser("chat", help="send a message and watch the streamed reply")
++    chat_cmd.add_argument("message")
++    chat_cmd.add_argument(
++        "--url", default=DEFAULT_URL, help=f"API base URL (default {DEFAULT_URL})"
++    )
++    chat_cmd.add_argument("--raw", action="store_true", help="print the raw SSE lines")
+ 
+     args = parser.parse_args(argv)
+     if args.command == "graph":
+@@ -21,7 +115,8 @@
+         # external web API, so it's deliberately not used.)
+         graph = build_graph(make_reply_models(get_settings()))  # no network call
+         print(graph.get_graph().draw_mermaid())
+-    return 0
++        return 0
++    return chat(args.message, args.url, args.raw, sys.stdout)
+ 
+ 
+ if __name__ == "__main__":
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/src/trailmate_workflow/graph/events.py day-4/src/trailmate_workflow/graph/events.py
+--- day-3/src/trailmate_workflow/graph/events.py	1970-01-01 05:30:00
++++ day-4/src/trailmate_workflow/graph/events.py	2026-11-19 00:35:33
+@@ -0,0 +1,23 @@
++"""What reply nodes push into LangGraph's *custom* stream.
++
++`get_stream_writer()` gives the currently running node a function that sends any payload
++to whoever is consuming `graph.astream(..., stream_mode=["custom", ...])`. When the graph
++runs with `ainvoke` (no streaming), the writer is a harmless no-op, so the same node code
++serves both `/chat` and `/chat/stream`.
++
++Only two payload shapes exist; streaming.py turns them into SSE events:
++    {"type": "token",   "text": str}                          → event: token
++    {"type": "retract", "reason": str, "replacement": str}    → event: retract
++"""
++
++from langgraph.config import get_stream_writer
++
++
++def emit_token(text: str) -> None:
++    """Send reply text the client should show now."""
++    get_stream_writer()({"type": "token", "text": text})
++
++
++def emit_retract(reason: str, replacement: str) -> None:
++    """Tell the client to discard all reply text shown so far and show `replacement`."""
++    get_stream_writer()({"type": "retract", "reason": reason, "replacement": replacement})
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/src/trailmate_workflow/graph/model_nodes.py day-4/src/trailmate_workflow/graph/model_nodes.py
+--- day-3/src/trailmate_workflow/graph/model_nodes.py	2026-11-19 00:31:39
++++ day-4/src/trailmate_workflow/graph/model_nodes.py	2026-11-19 00:35:34
+@@ -3,14 +3,19 @@
+ The routing decision was already made (by plain code) before these nodes run. If the
+ model call fails for any reason, the node falls back to a fixed template, and that
+ fallback decision is code, not a model.
++
++Day 4: the node streams. Each chunk the model produces is pushed to the client right
++away (emit_token) and also collected, so the full reply still lands in state for
++`respond`, for `/chat`, and for the Day 5 output guardrail.
+ """
+ 
+ import time
+ from collections.abc import Awaitable, Callable
+ from typing import Any
+ 
+-from langchain_core.messages import HumanMessage, SystemMessage
++from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+ 
++from trailmate_workflow.graph.events import emit_retract, emit_token
+ from trailmate_workflow.graph.state import TrailState, trace_step
+ from trailmate_workflow.llm import TierModel, model_name_from
+ 
+@@ -20,7 +25,7 @@
+ def make_model_reply_node(
+     node_name: str, tier_model: TierModel, system_prompt: str, fallback_reply: str
+ ) -> Node:
+-    """Build a node that asks `tier_model` for a reply to the (normalized) user text.
++    """Build a node that streams `tier_model`'s reply to the (normalized) user text.
+ 
+     A factory (a function that returns the node) lets one implementation serve every
+     model-backed path, each with its own tier, prompt, and fallback.
+@@ -29,11 +34,22 @@
+     async def model_reply(state: TrailState) -> dict[str, Any]:
+         started = time.perf_counter()
+         messages = [SystemMessage(system_prompt), HumanMessage(state["text"])]
++        full: AIMessageChunk | None = None  # chunks added together (`+`) = the whole message
++        sent_any = False
+         try:
+-            message = await tier_model.model.ainvoke(messages)
++            async for chunk in tier_model.model.astream(messages):
++                full = chunk if full is None else full + chunk
++                if chunk.text:
++                    emit_token(chunk.text)
++                    sent_any = True
+         except Exception as exc:  # proxy down, timeout, bad response, …: degrade, don't crash
+             # (asyncio.CancelledError is a BaseException, so a client disconnect still
+             # cancels the run instead of being swallowed here.)
++            if sent_any:
++                # The client already shows part of a reply: tell it to replace that text.
++                emit_retract("model_error", fallback_reply)
++            else:
++                emit_token(fallback_reply)
+             return {
+                 "reply": fallback_reply,
+                 "tier": tier_model.tier,
+@@ -49,9 +65,9 @@
+                     )
+                 ],
+             }
+-        model = model_name_from(message)
++        model = model_name_from(full) if full is not None else None
+         return {
+-            "reply": message.text,
++            "reply": full.text if full is not None else "",
+             "tier": tier_model.tier,
+             "model": model,
+             "fallback_used": False,
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/src/trailmate_workflow/graph/nodes.py day-4/src/trailmate_workflow/graph/nodes.py
+--- day-3/src/trailmate_workflow/graph/nodes.py	2026-11-19 00:31:39
++++ day-4/src/trailmate_workflow/graph/nodes.py	2026-11-19 00:35:34
+@@ -10,6 +10,7 @@
+ 
+ from trailmate_workflow import templates
+ from trailmate_workflow.classifier import classify as classify_text
++from trailmate_workflow.graph.events import emit_token
+ from trailmate_workflow.graph.state import TrailState, trace_step
+ from trailmate_workflow.normalize import normalize_text
+ 
+@@ -38,10 +39,16 @@
+ 
+ 
+ async def reject_reply(state: TrailState) -> dict[str, Any]:
+-    """Out-of-scope requests get a fixed, polite refusal. Never a model."""
++    """Out-of-scope requests get a fixed, polite refusal. Never a model.
++
++    Day 4: a template has no tokens to stream, so it's sent as ONE token event: honest,
++    and the client handles it exactly like a model reply. (No fake "typing".)
++    """
+     started = time.perf_counter()
++    reply = templates.render_reject(state["matched_rules"])
++    emit_token(reply)
+     return {
+-        "reply": templates.render_reject(state["matched_rules"]),
++        "reply": reply,
+         "tier": None,
+         "model": None,
+         "fallback_used": False,
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/src/trailmate_workflow/observability.py day-4/src/trailmate_workflow/observability.py
+--- day-3/src/trailmate_workflow/observability.py	1970-01-01 05:30:00
++++ day-4/src/trailmate_workflow/observability.py	2026-11-19 00:35:34
+@@ -0,0 +1,25 @@
++"""Request logging shared by the JSON and the streaming endpoints.
++
++Rule: log metadata only (ids, route, tier, verdicts, timings), never user or model text.
++"""
++
++import logging
++import time
++
++from trailmate_workflow.schemas import ChatResponse
++
++logger = logging.getLogger("trailmate")
++
++
++def log_request(response: ChatResponse, started: float) -> None:
++    """One metadata-only log line per request."""
++    logger.info(
++        "request_id=%s route=%s tier=%s model=%s fallback=%s nodes=%s total_ms=%.1f",
++        response.request_id,
++        response.route,
++        response.tier,
++        response.model,
++        response.fallback_used,
++        ",".join(step.node for step in response.trace),
++        (time.perf_counter() - started) * 1000,
++    )
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/src/trailmate_workflow/sse.py day-4/src/trailmate_workflow/sse.py
+--- day-3/src/trailmate_workflow/sse.py	1970-01-01 05:30:00
++++ day-4/src/trailmate_workflow/sse.py	2026-11-19 00:35:33
+@@ -0,0 +1,44 @@
++"""A minimal Server-Sent Events parser (client side), following the WHATWG rules we need.
++
++The wire format is plain text. Each event is a few `field: value` lines followed by a
++blank line:
++
++    event: token
++    data: {"text": "Try "}
++    <blank line>          ← dispatches the event
++
++Lines starting with ':' are comments; servers send them as keep-alive pings. Several
++`data:` lines in one event are joined with "\\n". An event cut off before its blank line
++is never dispatched.
++"""
++
++import json
++from collections.abc import Iterable, Iterator
++from dataclasses import dataclass
++from typing import Any
++
++
++@dataclass(frozen=True)
++class SSEEvent:
++    event: str
++    data: dict[str, Any]
++
++
++def parse_sse(lines: Iterable[str]) -> Iterator[SSEEvent]:
++    """Turn lines of an SSE stream into events whose `data` is decoded JSON."""
++    event, data_lines = "message", []
++    for line in lines:
++        if line == "":  # blank line: dispatch the event built so far
++            if data_lines:
++                yield SSEEvent(event, json.loads("\n".join(data_lines)))
++            event, data_lines = "message", []
++        elif line.startswith(":"):  # comment, e.g. a keep-alive ping
++            continue
++        else:
++            field, _, value = line.partition(":")
++            value = value.removeprefix(" ")  # one optional space after the colon
++            if field == "event":
++                event = value
++            elif field == "data":
++                data_lines.append(value)
++            # `id:` and `retry:` matter for auto-reconnecting clients; ignored here.
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/src/trailmate_workflow/streaming.py day-4/src/trailmate_workflow/streaming.py
+--- day-3/src/trailmate_workflow/streaming.py	1970-01-01 05:30:00
++++ day-4/src/trailmate_workflow/streaming.py	2026-11-19 00:35:34
+@@ -0,0 +1,64 @@
++"""Turn one graph run into a sequence of SSE events.
++
++    start → step (per node, as it finishes) → token… / retract → done      (or → error)
++
++We consume three LangGraph stream modes at once, using the v2 output format, where every
++item is a self-describing dict {"type", "ns", "data"}:
++
++- "updates": after each node finishes, {node_name: the partial update it returned}.
++             We forward ONLY the new trace step(s), so reply text never leaks into `step`.
++- "custom":  whatever nodes pushed with get_stream_writer(): reply tokens and retracts.
++- "values":  the full state after each step. We keep the last one to build `done`.
++"""
++
++import json
++import logging
++import time
++from collections.abc import AsyncIterator
++from typing import Any
++
++from trailmate_workflow.graph.state import initial_state
++from trailmate_workflow.observability import log_request
++from trailmate_workflow.schemas import ChatResponse
++
++logger = logging.getLogger("trailmate")
++
++GENERIC_ERROR = "Something went wrong. Please try again."
++
++
++def _event(name: str, payload: dict[str, Any]) -> dict[str, str]:
++    """An event in the dict shape sse-starlette's EventSourceResponse accepts."""
++    return {"event": name, "data": json.dumps(payload)}
++
++
++async def chat_events(graph: Any, request_id: str, message: str) -> AsyncIterator[dict[str, str]]:
++    """Run the graph for one message and yield SSE events as things happen."""
++    started = time.perf_counter()
++    yield _event("start", {"request_id": request_id})
++
++    final_state = None
++    try:
++        async for part in graph.astream(
++            initial_state(request_id, message),
++            stream_mode=["updates", "custom", "values"],
++            version="v2",
++        ):
++            kind, data = part["type"], part["data"]
++            if kind == "updates":
++                for update in data.values():
++                    for step in (update or {}).get("trace", []):
++                        yield _event("step", step)
++            elif kind == "custom":
++                yield _event(data["type"], {k: v for k, v in data.items() if k != "type"})
++            elif kind == "values":
++                final_state = data
++    except Exception as exc:
++        # Metadata only in the log line; the full traceback only at DEBUG level.
++        logger.error("stream failed request_id=%s error=%s", request_id, type(exc).__name__)
++        logger.debug("stream failure traceback", exc_info=True)
++        yield _event("error", {"message": GENERIC_ERROR})
++        return
++
++    response = ChatResponse.from_state(final_state)
++    log_request(response, started)
++    yield _event("done", response.model_dump())
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/tests/helpers.py day-4/tests/helpers.py
+--- day-3/tests/helpers.py	2026-11-19 00:29:15
++++ day-4/tests/helpers.py	2026-11-19 00:34:46
+@@ -15,6 +15,7 @@
+ from trailmate_workflow.api import create_app, get_graph
+ from trailmate_workflow.graph.state import TraceStep, TrailState
+ from trailmate_workflow.llm import ReplyModels, TierModel
++from trailmate_workflow.sse import SSEEvent, parse_sse
+ 
+ 
+ @asynccontextmanager
+@@ -86,3 +87,8 @@
+ 
+ def steps_named(state: TrailState) -> Iterator[str]:
+     return (s["node"] for s in state["trace"])
++
++
++def events_of(body: str) -> list[SSEEvent]:
++    """Parse a complete SSE response body into events (same parser the CLI uses)."""
++    return list(parse_sse(body.splitlines()))
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/tests/test_cli.py day-4/tests/test_cli.py
+--- day-3/tests/test_cli.py	2026-11-19 00:22:36
++++ day-4/tests/test_cli.py	2026-11-19 00:36:31
+@@ -1,10 +1,78 @@
+ """Tests for the `trailmate` command-line tool."""
+ 
+-from trailmate_workflow.cli import main
++import io
+ 
++from trailmate_workflow.cli import EventPrinter, main
++from trailmate_workflow.sse import SSEEvent
+ 
++
++def render(events: list[SSEEvent]) -> str:
++    out = io.StringIO()
++    printer = EventPrinter(out)
++    for event in events:
++        printer(event)
++    return out.getvalue()
++
++
+ def test_cli_graph_prints_mermaid(capsys) -> None:
+     assert main(["graph"]) == 0
+ 
+     out = capsys.readouterr().out
+     assert "classify" in out and "reject_reply" in out
++
++
++def test_printer_shows_steps_tokens_and_summary() -> None:
++    text = render(
++        [
++            SSEEvent(
++                "step",
++                {
++                    "node": "classify",
++                    "outcome": "trail",
++                    "details": {"rules": ["trail:kw:hike"]},
++                    "duration_ms": 0.1,
++                },
++            ),
++            SSEEvent("token", {"text": "Try "}),
++            SSEEvent("token", {"text": "this."}),
++            SSEEvent(
++                "done",
++                {"route": "trail", "tier": "smart", "model": "m", "fallback_used": False},
++            ),
++        ]
++    )
++
++    assert "classify" in text and "trail:kw:hike" in text
++    assert "Try this." in text  # tokens are printed inline, as they arrive
++    assert "route=trail" in text and "tier=smart" in text
++
++
++def test_printer_starts_a_new_line_for_a_step_after_tokens() -> None:
++    text = render(
++        [
++            SSEEvent("token", {"text": "Try this."}),
++            SSEEvent(
++                "step",
++                {"node": "trail_reply", "outcome": "generated", "details": {}, "duration_ms": 1},
++            ),
++        ]
++    )
++
++    assert "Try this.\n" in text
++
++
++def test_printer_shows_retract_replacement() -> None:
++    text = render(
++        [
++            SSEEvent("token", {"text": "Partial "}),
++            SSEEvent("retract", {"reason": "model_error", "replacement": "Fixed reply."}),
++        ]
++    )
++
++    assert "replaced" in text and "model_error" in text and "Fixed reply." in text
++
++
++def test_chat_exits_1_when_api_unreachable(capsys) -> None:
++    assert main(["chat", "hi", "--url", "http://127.0.0.1:9"]) == 1
++
++    assert "not reachable" in capsys.readouterr().out
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store day-3/tests/test_streaming.py day-4/tests/test_streaming.py
+--- day-3/tests/test_streaming.py	1970-01-01 05:30:00
++++ day-4/tests/test_streaming.py	2026-11-19 00:35:34
+@@ -0,0 +1,114 @@
++"""Day 4: the SSE endpoint and the event protocol.
++
++httpx's ASGITransport buffers the whole response body, which is fine here: every stream
++ends after `done` (or `error`). Tests parse the body with the same parser the CLI uses.
++"""
++
++import json
++
++from helpers import ScriptedChatModel, client_for, events_of, make_models
++
++from trailmate_workflow import templates
++from trailmate_workflow.graph.builder import build_graph
++from trailmate_workflow.graph.state import initial_state
++from trailmate_workflow.sse import SSEEvent, parse_sse
++from trailmate_workflow.streaming import chat_events
++
++
++async def stream(graph, message: str) -> list[SSEEvent]:
++    async with client_for(graph) as client:
++        response = await client.post("/chat/stream", json={"message": message})
++    assert response.status_code == 200
++    assert response.headers["content-type"].startswith("text/event-stream")
++    return events_of(response.text)
++
++
++def tokens(events: list[SSEEvent]) -> list[str]:
++    return [e.data["text"] for e in events if e.event == "token"]
++
++
++def test_parse_sse_handles_comments_multiline_and_default_event() -> None:
++    lines = [": ping", "event: token", 'data: {"text": "hi"}', "", 'data: {"a":', "data: 1}", ""]
++
++    assert list(parse_sse(lines)) == [
++        SSEEvent("token", {"text": "hi"}),
++        SSEEvent("message", {"a": 1}),
++    ]
++
++
++async def test_model_path_streams_many_tokens() -> None:
++    trail = ScriptedChatModel(chunks=["Try ", "the ", "lakeside ", "loop."])
++
++    events = await stream(build_graph(make_models(trail=trail)), "easy hike?")
++
++    assert events[0].event == "start" and events[-1].event == "done"
++    assert tokens(events) == ["Try ", "the ", "lakeside ", "loop."]
++    assert "".join(tokens(events)) == events[-1].data["response"] == "Try the lakeside loop."
++    assert [e.data["node"] for e in events if e.event == "step"] == [
++        "receive",
++        "classify",
++        "trail_reply",
++        "respond",
++    ]
++
++
++async def test_templated_path_sends_exactly_one_token() -> None:
++    events = await stream(build_graph(make_models()), "write python code")
++
++    assert tokens(events) == [events[-1].data["response"]]
++    assert events[-1].data["route"] == "reject"
++
++
++async def test_steps_never_carry_reply_text() -> None:
++    trail = ScriptedChatModel(chunks=["Try ", "the ", "lakeside ", "loop."])
++
++    events = await stream(build_graph(make_models(trail=trail)), "easy hike?")
++
++    assert all("lakeside" not in json.dumps(e.data) for e in events if e.event == "step")
++
++
++async def test_model_failure_before_any_token_sends_fallback_as_one_token() -> None:
++    failing = ScriptedChatModel(chunks=[], fail_after=0)
++
++    events = await stream(build_graph(make_models(trail=failing)), "easy hike?")
++
++    assert tokens(events) == [templates.TRAIL_FALLBACK_REPLY]
++    assert not [e for e in events if e.event == "retract"]
++    assert events[-1].data["fallback_used"] is True
++
++
++async def test_model_failure_mid_stream_retracts() -> None:
++    partial = ScriptedChatModel(chunks=["Partial ", "text "], fail_after=2)
++
++    events = await stream(build_graph(make_models(trail=partial)), "easy hike?")
++
++    retracts = [e for e in events if e.event == "retract"]
++    assert len(retracts) == 1
++    assert retracts[0].data == {
++        "reason": "model_error",
++        "replacement": templates.TRAIL_FALLBACK_REPLY,
++    }
++    assert events[-1].data["response"] == templates.TRAIL_FALLBACK_REPLY
++
++
++async def test_unexpected_error_yields_error_event() -> None:
++    class BrokenGraph:
++        async def astream(self, *args, **kwargs):
++            raise RuntimeError("boom")
++            yield  # pragma: no cover  (makes this an async generator)
++
++    names = [e["event"] async for e in chat_events(BrokenGraph(), "r", "hi")]
++
++    assert names == ["start", "error"]
++
++
++async def test_chat_events_aclose_mid_stream_is_clean() -> None:
++    """A client that disconnects mid-stream must not break the shared graph."""
++    graph = build_graph(make_models())
++    events = chat_events(graph, "r", "easy hike?")
++    async for event in events:
++        if event["event"] == "token":
++            break
++    await events.aclose()  # what the server does when the client goes away
++
++    assert (await graph.ainvoke(initial_state("r2", "hello")))["response"]
