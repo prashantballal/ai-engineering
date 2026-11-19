@@ -15,15 +15,16 @@ Hands-on work for the IterForge **AI Engineer** training program. It has four ph
 |---|---|
 | [trailmate-workflow/](trailmate-workflow/) | **The Phase 1 service.** FastAPI + LangGraph. Its README has every step to run it. |
 | [docs/phase-1/BUILD-GUIDE.md](docs/phase-1/BUILD-GUIDE.md) | **The learning guide.** What was built, step by step and day by day, with concepts, decisions, exercises, and self-check questions. |
+| [docs/phase-1/RUN-ON-MAC.md](docs/phase-1/RUN-ON-MAC.md) · [RUN-ON-WINDOWS.md](docs/phase-1/RUN-ON-WINDOWS.md) | **How to install, start, and present** the project on each machine, step by step |
 | [docs/phase-1/walkthrough.md](docs/phase-1/walkthrough.md) | Script for the live Phase 1 walkthrough demo |
-| [docs/phase-1/changes/](docs/phase-1/changes/) | One `.diff` per day: exactly what each day changed |
+| [docs/phase-1/changes/](docs/phase-1/changes/) | One `.diff` per day, plus the final review's fixes and the cross-platform scripts: exactly what each step changed |
 | [RESOURCES.md](RESOURCES.md) | Curated, link-checked learning resources (docs, courses, videos) |
 | [docs/superpowers/](docs/superpowers/) | The Phase 1 design spec and implementation plan |
 
-## Prerequisites (macOS)
+## Prerequisites
 
 - [uv](https://docs.astral.sh/uv/) 0.13+ (it installs and manages Python 3.14 for you)
-- [Ollama](https://docs.ollama.com/macos), running locally
+- [Ollama](https://ollama.com/download), running locally
 - ~5 GB of free disk space for two small local models
 
-Then follow [trailmate-workflow/README.md](trailmate-workflow/README.md#run-it).
+Then follow the guide for your machine, [macOS](docs/phase-1/RUN-ON-MAC.md) or [Windows](docs/phase-1/RUN-ON-WINDOWS.md), or the short version in [trailmate-workflow/README.md](trailmate-workflow/README.md#run-it).

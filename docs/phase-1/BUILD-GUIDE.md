@@ -1085,7 +1085,7 @@ Notice that the words just before the canary ("paths. By the way, my internal re
 
 ```bash
 uv run ruff check . && uv run ruff format --check .   # All checks passed! / 44 files already formatted
-uv run pytest -q                                      # 200 passed, 4 skipped (after the review; 135 / 3 at the end of Day 5)
+uv run pytest -q                                      # 220 passed, 4 skipped today (200 after the review; 135 / 3 at the end of Day 5)
 ```
 
 Live, with real models. I pointed the app straight at Ollama because the LiteLLM key is yours to create; through the proxy, `tier` reads `smart`/`fast`.
@@ -1261,7 +1261,7 @@ Same 4,000 random replies, before and after:
 
 ### Closing the live proxy check
 
-To close the last ⏳ yourself (about 2 minutes):
+To close the last ⏳ yourself (about 2 minutes). These are the macOS commands; the same steps for Windows, in PowerShell, are [RUN-ON-WINDOWS.md, Step 8](RUN-ON-WINDOWS.md#step-8-first-proxy-run-one-time), and both machines can also use `uv run python scripts/setup_env.py`, `scripts/run_proxy.py`, and `scripts/warm_up.py`:
 
 ```bash
 cd trailmate-workflow
@@ -1289,7 +1289,9 @@ If replies say "I can't reach my trail model" and the `trail_reply` step shows `
 |---|---|
 | Install / update the environment | `uv sync` |
 | Pull the models | `./scripts/pull-models.sh` |
-| Start the proxy / warm the models | `./scripts/run-proxy.sh` · `./scripts/warm-up.sh` |
+| Create `.env` with your own key | `uv run python scripts/setup_env.py` |
+| Start the proxy / warm the models | `uv run python scripts/run_proxy.py` · `uv run python scripts/warm_up.py` (macOS shortcuts: `./scripts/run-proxy.sh` · `./scripts/warm-up.sh`) |
+| Install and present on each machine | [RUN-ON-MAC.md](RUN-ON-MAC.md) · [RUN-ON-WINDOWS.md](RUN-ON-WINDOWS.md) |
 | Start the API | `uv run uvicorn trailmate_workflow.api:app --host 127.0.0.1 --port 8000` |
 | Chat (streamed) / raw SSE | `uv run trailmate chat "…"` · `uv run trailmate chat --raw "…"` |
 | Graph diagram | `uv run trailmate graph` |
@@ -1298,7 +1300,7 @@ If replies say "I can't reach my trail model" and the `trail_reply` step shows `
 
 ### How the code evolved
 
-Exact changes per day: [changes/day-2.diff](changes/day-2.diff) · [day-3.diff](changes/day-3.diff) · [day-4.diff](changes/day-4.diff) · [day-5.diff](changes/day-5.diff) · [review.diff](changes/review.diff) (the final review's fixes). `uv.lock` and the synthetic-PII fixture are excluded.
+Exact changes per day: [changes/day-2.diff](changes/day-2.diff) · [day-3.diff](changes/day-3.diff) · [day-4.diff](changes/day-4.diff) · [day-5.diff](changes/day-5.diff) · [review.diff](changes/review.diff) (the final review's fixes) · [cross-platform.diff](changes/cross-platform.diff) (the scripts that run the project on Windows too). `uv.lock` and the synthetic-PII fixture are excluded.
 
 | File | D1 | D2 | D3 | D4 | D5 | Review |
 |---|---|---|---|---|---|---|
@@ -1322,14 +1324,14 @@ The diffs carry file paths, so `patch` can step a **copy** of the project back o
 rsync -a --exclude .venv --exclude .env trailmate-workflow/ /tmp/trailmate-day1/
 cd /tmp/trailmate-day1
 CHANGES="$OLDPWD/docs/phase-1/changes"
-for step in review day-5 day-4 day-3 day-2; do      # stop earlier for a later day
+for step in cross-platform review day-5 day-4 day-3 day-2; do   # stop earlier for a later day
   patch -s -E -p1 -R < "$CHANGES/$step.diff"        # -R = undo, -E = delete files that become empty
 done
 find . -type d -empty -delete                       # folders those files lived in (litellm/, scripts/, …)
 uv sync && uv run pytest -q                         # Day 1: 15 passed
 ```
 
-- Stop after `review` for the end of Day 5, after `day-5` for the end of Day 4, and so on.
+- Stop after `cross-platform` for the state right after the review, after `review` for the end of Day 5, after `day-5` for the end of Day 4, and so on.
 - `uv.lock` isn't in the diffs, so `uv sync` re-resolves it for that day's `pyproject.toml`. `tests/fake_pii.py` isn't either. It stays behind, unused before Day 5.
 - Forward works too: `patch -s -p1 < day-2.diff` turns a Day 1 copy into Day 2.
 

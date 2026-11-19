@@ -11,12 +11,15 @@ TrailMate's Phase 1 service: a **deterministic** LangGraph workflow behind FastA
 
 ## Run it
 
-### Prerequisites (macOS)
+> **Step-by-step guides, including everything to install:** [macOS](../docs/phase-1/RUN-ON-MAC.md) · [Windows](../docs/phase-1/RUN-ON-WINDOWS.md).
+> The `uv run …` and `ollama …` commands below are the same on both. The `.sh` scripts are macOS/Linux shortcuts; Windows uses the `scripts/*.py` versions shown here.
+
+### Prerequisites
 
 | Tool | Check | Install |
 |---|---|---|
-| uv ≥ 0.13 | `uv --version` | `brew install uv` |
-| Ollama (running) | `curl -s 127.0.0.1:11434/api/version` | [ollama.com/download](https://ollama.com/download) |
+| uv ≥ 0.13 | `uv --version` | macOS: `brew install uv` · Windows: `winget install --id=astral-sh.uv -e` |
+| Ollama (running) | `curl -s 127.0.0.1:11434/api/version` (Windows: `curl.exe`) | [ollama.com/download](https://ollama.com/download) |
 | ~5 GB free disk | | |
 
 ### 1. One-time setup
@@ -24,9 +27,9 @@ TrailMate's Phase 1 service: a **deterministic** LangGraph workflow behind FastA
 ```bash
 cd trailmate-workflow
 uv sync                                   # installs Python 3.14 + all dependencies from uv.lock
-./scripts/pull-models.sh                  # llama3.2:1b (tier "fast") + qwen3:4b-instruct (tier "smart"), ~3.8 GB
-cp .env.example .env
-printf 'LITELLM_MASTER_KEY=sk-%s\n' "$(openssl rand -hex 32)" >> .env   # YOUR local proxy key
+ollama pull llama3.2:1b                   # tier "fast"  (1.3 GB)
+ollama pull qwen3:4b-instruct             # tier "smart" (2.5 GB)
+uv run python scripts/setup_env.py        # creates .env with YOUR own proxy key (never printed)
 ```
 
 **LiteLLM 1.110 refuses to start without a master key.** The last command creates your own random key in `.env`, which is gitignored. Never commit or share it. The proxy and the app both read it from there.
@@ -35,10 +38,10 @@ printf 'LITELLM_MASTER_KEY=sk-%s\n' "$(openssl rand -hex 32)" >> .env   # YOUR l
 
 ```bash
 # terminal 1: the LiteLLM proxy (127.0.0.1:4000)
-./scripts/run-proxy.sh
+uv run python scripts/run_proxy.py        # macOS shortcut: ./scripts/run-proxy.sh
 
 # terminal 2: the API (127.0.0.1:8000)
-./scripts/warm-up.sh                      # loads both models now, so the first request isn't slow
+uv run python scripts/warm_up.py          # loads both models now, so the first request isn't slow
 uv run uvicorn trailmate_workflow.api:app --host 127.0.0.1 --port 8000
 ```
 
@@ -77,7 +80,7 @@ Example output (`trailmate chat`). This was captured during development with the
 ### 4. Tests
 
 ```bash
-uv run pytest -q                                   # 200 tests, hermetic (fake models, no Ollama or proxy)
+uv run pytest -q                                   # 220 passed, 4 skipped (Windows: 219 / 5), no Ollama or proxy needed
 RUN_INTEGRATION=1 uv run pytest -m integration -q  # 4 live tests: needs the proxy + Ollama running
 uv run ruff check . && uv run ruff format --check .
 ```
@@ -86,9 +89,9 @@ uv run ruff check . && uv run ruff format --check .
 
 | Symptom | Fix |
 |---|---|
-| `run-proxy.sh`: "LITELLM_MASTER_KEY is not set" | Run the `printf … >> .env` line from step 1 |
-| Replies say "I can't reach my trail model right now" | The proxy isn't running or can't reach Ollama. Start `./scripts/run-proxy.sh` and check `ollama list`. |
-| First reply takes 5–10 s | Cold start while the model loads. Run `./scripts/warm-up.sh` first. |
+| "LITELLM_MASTER_KEY is not set" | Run `uv run python scripts/setup_env.py` (step 1) |
+| Replies say "I can't reach my trail model right now" | The proxy isn't running or can't reach Ollama. Start `uv run python scripts/run_proxy.py` and check `ollama list`. |
+| First reply takes 5–10 s | Cold start while the model loads. Run `uv run python scripts/warm_up.py` first. |
 | `trailmate: command not found` | Run `uv sync` (it installs the entry point), and use `uv run trailmate …` |
 | `curl` shows the stream all at once | Add `-N` |
 | VS Code: "package not installed" / "import could not be resolved" | Select the interpreter `trailmate-workflow/.venv/bin/python` |
@@ -203,5 +206,5 @@ Which real model sits behind each tier is set in [litellm/config.yaml](litellm/c
 | `src/trailmate_workflow/config.py`, `schemas.py`, `observability.py` | Settings; HTTP contract; metadata-only request log |
 | `src/trailmate_workflow/sse.py`, `cli.py` | SSE parser; `trailmate chat` / `trailmate graph` |
 | `litellm/config.yaml` | Tiers → Ollama models, fallback, timeouts, master key (from env) |
-| `scripts/` | `pull-models.sh`, `run-proxy.sh`, `warm-up.sh`, `demo_retract.py` |
-| `tests/` | 200 hermetic tests + 4 opt-in live tests. `fake_pii.py` holds the only (synthetic) personal-data test values. |
+| `scripts/` | Any OS: `setup_env.py` (your key), `run_proxy.py`, `warm_up.py`, `demo_retract.py`. macOS/Linux shortcuts: `pull-models.sh`, `run-proxy.sh`, `warm-up.sh` |
+| `tests/` | 220 hermetic tests + 4 opt-in live tests. `fake_pii.py` holds the only (synthetic) personal-data test values. |

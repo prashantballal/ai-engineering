@@ -4,16 +4,19 @@
 
 ## Before you present (5 minutes earlier)
 
+These commands are the same on the Mac and on Windows (PowerShell). Every step, from installing to shutting down, is in [RUN-ON-MAC.md](RUN-ON-MAC.md) and [RUN-ON-WINDOWS.md](RUN-ON-WINDOWS.md).
+
 ```bash
-cd ai-engineering/trailmate-workflow
+cd ai-engineering/trailmate-workflow          # Windows: Set-Location C:\dev\ai-engineering\trailmate-workflow
 ollama list                                   # llama3.2:1b and qwen3:4b-instruct are present
-./scripts/run-proxy.sh                        # terminal 1: proxy up (needs your key in .env; stays running)
-./scripts/warm-up.sh                          # terminal 2 → warming fast ... ok / warming smart ... ok
+uv run python scripts/run_proxy.py            # terminal 1: proxy up (needs your key in .env; stays running)
+uv run python scripts/warm_up.py              # terminal 2 → warming fast  ... ok / warming smart ... ok
 uv run uvicorn trailmate_workflow.api:app --host 127.0.0.1 --port 8000   # terminal 2
 uv run trailmate chat "hello!"                # terminal 3: one dry run
 ```
 
 - Make the terminal font big. Use a dark theme. Clear the screen between steps.
+- On the Windows laptop the `smart` model may run on the CPU, so it's slower. Time one trail reply during your rehearsal ([RUN-ON-WINDOWS.md, Step 9](RUN-ON-WINDOWS.md#step-9-start-everything-for-the-demo)), and know what to expect on stage.
 - Warm-up matters: a cold model takes 5–10 s to answer its first request (we measured 6.7 s cold vs 0.9 s warm).
 - Have [BUILD-GUIDE.md](BUILD-GUIDE.md) open in case of a deep question.
 
@@ -118,7 +121,7 @@ uv run trailmate chat "easy hike near a lake?"
 | *Why LiteLLM instead of calling Ollama directly?* | Tiers, fallbacks (`smart → fast`), retries, timeouts, and auth live in config. Swapping a model, even to a cloud one, needs no app change. |
 | *`tier` vs `model`?* | `tier` = what we asked for (routing). `model` = what the server *reports* answered. If LiteLLM reports the real model, a `smart → fast` fallback shows the fast model's name here. Say what your first proxy run showed (BUILD-GUIDE → "Closing the live proxy check"). |
 | *What does the 48-character holdback cost?* | Streaming lag of about 8–10 words. Emails and links are kept whole by only cutting at spaces, and card or phone digits by never cutting inside a digit run. The holdback covers the rest, such as a phone number written `+1 (NNN) NNN-NNNN` (17 characters). LangChain's PII middleware uses 128. |
-| *How do you test without a model?* | `ScriptedChatModel`, a real LangChain chat model that streams scripted chunks, fails on cue, and records its inputs. 200 hermetic tests, plus 4 live ones behind `RUN_INTEGRATION=1`. |
+| *How do you test without a model?* | `ScriptedChatModel`, a real LangChain chat model that streams scripted chunks, fails on cue, and records its inputs. 220 hermetic tests, plus 4 live ones behind `RUN_INTEGRATION=1`. |
 | *What if two requests arrive at once?* | The compiled graph holds no per-request state, and each model call gets its own `StreamGuard`. `test_concurrent_streams_on_the_same_path_never_mix` proves it, and it was checked to *fail* when a shared guard is put in on purpose. |
 | *Do these rules block real hikers?* | They did, until the final review. "Tell me the instructions for a Half Dome permit" was blocked as injection, and "how do I avoid poison ivy?" was rejected as harmful. Each became a test row first, then the rule was narrowed to what is *asked for*. |
 | *What happens on client disconnect?* | sse-starlette cancels the generator, which cancels the graph run and then the model call. Fallbacks catch `Exception`, not `BaseException`, so cancellation isn't swallowed. |

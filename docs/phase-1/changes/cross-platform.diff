@@ -1,0 +1,613 @@
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store review/.env.example cross-platform/.env.example
+--- review/.env.example	2026-11-19 00:27:28
++++ cross-platform/.env.example	2026-11-19 13:38:00
+@@ -6,6 +6,8 @@
+ # --- LiteLLM proxy (Day 3) -----------------------------------------------------------
+ # REQUIRED: LiteLLM 1.110 refuses to start without a strong master key. Generate YOUR OWN
+ # key once (never share or commit it) by running this in trailmate-workflow/:
++#   uv run python scripts/setup_env.py     (macOS and Windows; it never prints the key)
++# or, on macOS / Linux only:
+ #   printf 'LITELLM_MASTER_KEY=sk-%s\n' "$(openssl rand -hex 32)" >> .env
+ # The proxy reads it via litellm/config.yaml (os.environ/LITELLM_MASTER_KEY), and the app
+ # sends it as "Authorization: Bearer ..." (LITELLM_API_KEY, falling back to LITELLM_MASTER_KEY).
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store review/README.md cross-platform/README.md
+--- review/README.md	2026-11-19 01:55:24
++++ cross-platform/README.md	2026-11-19 13:38:34
+@@ -11,12 +11,15 @@
+ 
+ ## Run it
+ 
+-### Prerequisites (macOS)
++> **Step-by-step guides, including everything to install:** [macOS](../docs/phase-1/RUN-ON-MAC.md) · [Windows](../docs/phase-1/RUN-ON-WINDOWS.md).
++> The `uv run …` and `ollama …` commands below are the same on both. The `.sh` scripts are macOS/Linux shortcuts; Windows uses the `scripts/*.py` versions shown here.
+ 
++### Prerequisites
++
+ | Tool | Check | Install |
+ |---|---|---|
+-| uv ≥ 0.13 | `uv --version` | `brew install uv` |
+-| Ollama (running) | `curl -s 127.0.0.1:11434/api/version` | [ollama.com/download](https://ollama.com/download) |
++| uv ≥ 0.13 | `uv --version` | macOS: `brew install uv` · Windows: `winget install --id=astral-sh.uv -e` |
++| Ollama (running) | `curl -s 127.0.0.1:11434/api/version` (Windows: `curl.exe`) | [ollama.com/download](https://ollama.com/download) |
+ | ~5 GB free disk | | |
+ 
+ ### 1. One-time setup
+@@ -24,9 +27,9 @@
+ ```bash
+ cd trailmate-workflow
+ uv sync                                   # installs Python 3.14 + all dependencies from uv.lock
+-./scripts/pull-models.sh                  # llama3.2:1b (tier "fast") + qwen3:4b-instruct (tier "smart"), ~3.8 GB
+-cp .env.example .env
+-printf 'LITELLM_MASTER_KEY=sk-%s\n' "$(openssl rand -hex 32)" >> .env   # YOUR local proxy key
++ollama pull llama3.2:1b                   # tier "fast"  (1.3 GB)
++ollama pull qwen3:4b-instruct             # tier "smart" (2.5 GB)
++uv run python scripts/setup_env.py        # creates .env with YOUR own proxy key (never printed)
+ ```
+ 
+ **LiteLLM 1.110 refuses to start without a master key.** The last command creates your own random key in `.env`, which is gitignored. Never commit or share it. The proxy and the app both read it from there.
+@@ -35,10 +38,10 @@
+ 
+ ```bash
+ # terminal 1: the LiteLLM proxy (127.0.0.1:4000)
+-./scripts/run-proxy.sh
++uv run python scripts/run_proxy.py        # macOS shortcut: ./scripts/run-proxy.sh
+ 
+ # terminal 2: the API (127.0.0.1:8000)
+-./scripts/warm-up.sh                      # loads both models now, so the first request isn't slow
++uv run python scripts/warm_up.py          # loads both models now, so the first request isn't slow
+ uv run uvicorn trailmate_workflow.api:app --host 127.0.0.1 --port 8000
+ ```
+ 
+@@ -77,7 +80,7 @@
+ ### 4. Tests
+ 
+ ```bash
+-uv run pytest -q                                   # 200 tests, hermetic (fake models, no Ollama or proxy)
++uv run pytest -q                                   # 220 passed, 4 skipped (Windows: 219 / 5), no Ollama or proxy needed
+ RUN_INTEGRATION=1 uv run pytest -m integration -q  # 4 live tests: needs the proxy + Ollama running
+ uv run ruff check . && uv run ruff format --check .
+ ```
+@@ -86,9 +89,9 @@
+ 
+ | Symptom | Fix |
+ |---|---|
+-| `run-proxy.sh`: "LITELLM_MASTER_KEY is not set" | Run the `printf … >> .env` line from step 1 |
+-| Replies say "I can't reach my trail model right now" | The proxy isn't running or can't reach Ollama. Start `./scripts/run-proxy.sh` and check `ollama list`. |
+-| First reply takes 5–10 s | Cold start while the model loads. Run `./scripts/warm-up.sh` first. |
++| "LITELLM_MASTER_KEY is not set" | Run `uv run python scripts/setup_env.py` (step 1) |
++| Replies say "I can't reach my trail model right now" | The proxy isn't running or can't reach Ollama. Start `uv run python scripts/run_proxy.py` and check `ollama list`. |
++| First reply takes 5–10 s | Cold start while the model loads. Run `uv run python scripts/warm_up.py` first. |
+ | `trailmate: command not found` | Run `uv sync` (it installs the entry point), and use `uv run trailmate …` |
+ | `curl` shows the stream all at once | Add `-N` |
+ | VS Code: "package not installed" / "import could not be resolved" | Select the interpreter `trailmate-workflow/.venv/bin/python` |
+@@ -203,5 +206,5 @@
+ | `src/trailmate_workflow/config.py`, `schemas.py`, `observability.py` | Settings; HTTP contract; metadata-only request log |
+ | `src/trailmate_workflow/sse.py`, `cli.py` | SSE parser; `trailmate chat` / `trailmate graph` |
+ | `litellm/config.yaml` | Tiers → Ollama models, fallback, timeouts, master key (from env) |
+-| `scripts/` | `pull-models.sh`, `run-proxy.sh`, `warm-up.sh`, `demo_retract.py` |
+-| `tests/` | 200 hermetic tests + 4 opt-in live tests. `fake_pii.py` holds the only (synthetic) personal-data test values. |
++| `scripts/` | Any OS: `setup_env.py` (your key), `run_proxy.py`, `warm_up.py`, `demo_retract.py`. macOS/Linux shortcuts: `pull-models.sh`, `run-proxy.sh`, `warm-up.sh` |
++| `tests/` | 220 hermetic tests + 4 opt-in live tests. `fake_pii.py` holds the only (synthetic) personal-data test values. |
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store review/pyproject.toml cross-platform/pyproject.toml
+--- review/pyproject.toml	2026-11-19 00:36:14
++++ cross-platform/pyproject.toml	2026-11-19 12:44:02
+@@ -29,6 +29,7 @@
+ dev = [
+     "pytest>=9.2.0",
+     "pytest-asyncio>=1.5.0",
++    "python-dotenv>=1.2.4",
+     "ruff>=0.17.5",
+ ]
+ 
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store review/scripts/run-proxy.sh cross-platform/scripts/run-proxy.sh
+--- review/scripts/run-proxy.sh	2026-11-19 00:27:27
++++ cross-platform/scripts/run-proxy.sh	2026-11-19 12:44:21
+@@ -3,7 +3,9 @@
+ #
+ # LiteLLM runs as an isolated uv *tool* (uvx): its very large dependency tree never
+ # touches the service's own environment, just like a separately deployed proxy in
+-# production. The version is pinned so every run behaves the same.
++# production. The version and its Python (3.12) are pinned so every run, on every
++# machine, behaves the same. Windows can't run this file: there (or anywhere) use
++#   uv run python scripts/run_proxy.py
+ set -euo pipefail
+ cd "$(dirname "$0")/.."                                  # the trailmate-workflow directory
+ 
+@@ -12,9 +14,13 @@
+ # LiteLLM (>= 1.10x) refuses to start without a strong master key. Fail fast, with the fix.
+ if [ -z "${LITELLM_MASTER_KEY:-}" ] && [ "${LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY:-}" != "true" ]; then
+   echo "LITELLM_MASTER_KEY is not set. Create your own local key once (stored in .env, gitignored):" >&2
+-  echo "  printf 'LITELLM_MASTER_KEY=sk-%s\n' \"\$(openssl rand -hex 32)\" >> .env" >&2
++  echo "  uv run python scripts/setup_env.py" >&2
+   exit 1
+ fi
+ 
+-exec uvx --from "litellm[proxy]==1.110.0" litellm \
++# The proxy never fetches anything on its own (model catalogs, tokenizers): it only talks
++# to Ollama, so it also starts without internet. Set it to false in .env to opt out.
++export LITELLM_OFFLINE_MODE="${LITELLM_OFFLINE_MODE:-true}"
++
++exec uvx --python 3.12 --from "litellm[proxy]==1.110.0" litellm \
+   --config litellm/config.yaml --host 127.0.0.1 --port 4000
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store review/scripts/run_proxy.py cross-platform/scripts/run_proxy.py
+--- review/scripts/run_proxy.py	1970-01-01 05:30:00
++++ cross-platform/scripts/run_proxy.py	2026-11-19 13:32:56
+@@ -0,0 +1,87 @@
++"""Start the LiteLLM proxy on http://127.0.0.1:4000. The same command on macOS, Linux, Windows:
++
++    uv run python scripts/run_proxy.py
++
++The cross-platform twin of run-proxy.sh (Windows can't run .sh scripts):
++1. It reads .env, but a variable already set in your shell wins, exactly as it does for the
++   app (pydantic-settings). So the app and the proxy always agree on the key.
++2. It stops with a clear message if there's no LITELLM_MASTER_KEY. (LiteLLM refuses to start
++   without one too, less helpfully.)
++3. It runs the pinned LiteLLM as an isolated uv tool on Python 3.12, so every machine runs the
++   same proxy, with LITELLM_OFFLINE_MODE=true, so the proxy never downloads anything on its
++   own. It only talks to Ollama.
++
++Ctrl+C stops it.
++"""
++
++import argparse
++import os
++import shutil
++import subprocess
++import sys
++from collections.abc import Callable, Mapping, Sequence
++from pathlib import Path
++
++from dotenv import dotenv_values
++
++SERVICE_DIR = Path(__file__).resolve().parent.parent  # trailmate-workflow/
++LITELLM = "litellm[proxy]==1.110.0"  # keep in step with run-proxy.sh
++TOOL_PYTHON = "3.12"  # LiteLLM's own Python, separate from the app's 3.14
++
++NO_KEY = (
++    "LITELLM_MASTER_KEY is not set, and LiteLLM won't start without one.\n"
++    "Create your own key once (it goes into .env and stays on this machine):\n"
++    "  uv run python scripts/setup_env.py\n"
++)
++
++
++def proxy_command(port: int = 4000) -> list[str]:
++    return [
++        "uvx", "--python", TOOL_PYTHON, "--from", LITELLM, "litellm",
++        "--config", "litellm/config.yaml", "--host", "127.0.0.1", "--port", str(port),
++    ]  # fmt: skip
++
++
++def proxy_environment(service_dir: Path, environ: Mapping[str, str]) -> dict[str, str]:
++    """Variables from .env, overridden by the shell's own, with offline mode on by default."""
++    from_file = {k: v for k, v in dotenv_values(service_dir / ".env").items() if v is not None}
++    return {"LITELLM_OFFLINE_MODE": "true", **from_file, **environ}
++
++
++def main(
++    argv: Sequence[str] = (),
++    popen: Callable[..., subprocess.Popen] | None = None,
++    which=shutil.which,
++) -> int:
++    parser = argparse.ArgumentParser(description="Start the LiteLLM proxy for TrailMate.")
++    parser.add_argument(
++        "--port",
++        type=int,
++        default=4000,
++        help="port to listen on (default 4000). If you change it, set LITELLM_BASE_URL in "
++        ".env to match, e.g. http://127.0.0.1:4100/v1",
++    )
++    args = parser.parse_args(argv)
++    env = proxy_environment(SERVICE_DIR, os.environ)
++    if not env.get("LITELLM_MASTER_KEY"):
++        print(NO_KEY, end="", file=sys.stderr)
++        return 1
++    if which("uvx") is None:
++        print(
++            "uvx not found. Install uv (see the run guide), then open a new terminal.",
++            file=sys.stderr,
++        )
++        return 1
++    process = (popen or subprocess.Popen)(proxy_command(args.port), cwd=SERVICE_DIR, env=env)
++    try:
++        return process.wait()
++    except KeyboardInterrupt:  # Ctrl+C reached the proxy too: give it time to shut down cleanly
++        try:
++            return process.wait(timeout=15)
++        except subprocess.TimeoutExpired:
++            process.kill()
++            return 130
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store review/scripts/setup_env.py cross-platform/scripts/setup_env.py
+--- review/scripts/setup_env.py	1970-01-01 05:30:00
++++ cross-platform/scripts/setup_env.py	2026-11-19 12:40:52
+@@ -0,0 +1,56 @@
++"""Create .env with YOUR OWN LiteLLM master key. The same command on macOS, Linux and Windows:
++
++    uv run python scripts/setup_env.py
++
++1. If there's no .env yet, it copies .env.example to .env.
++2. If .env has no LITELLM_MASTER_KEY yet, it adds one: "sk-" plus 64 random hex characters.
++
++It's safe to run again: it never replaces a key that's already there, and it never prints
++one. The key stays on this machine. On another machine, run this there; don't copy .env.
++"""
++
++import os
++import secrets
++import shutil
++import sys
++from collections.abc import Callable
++from pathlib import Path
++
++from dotenv import dotenv_values
++
++SERVICE_DIR = Path(__file__).resolve().parent.parent  # trailmate-workflow/
++
++
++def random_secret() -> str:
++    return secrets.token_hex(32)  # 32 random bytes from the operating system, as hex
++
++
++def ensure_env(service_dir: Path, new_secret: Callable[[], str] | None = None) -> list[str]:
++    """Make sure service_dir/.env exists and holds a master key. Returns what was done."""
++    env_file = service_dir / ".env"
++    done = []
++    if not env_file.exists():
++        shutil.copyfile(service_dir / ".env.example", env_file)
++        done.append("created .env from .env.example")
++    if dotenv_values(env_file).get("LITELLM_MASTER_KEY"):
++        done.append("LITELLM_MASTER_KEY is already set in .env, so it was left as it is")
++        return done
++    text = env_file.read_text(encoding="utf-8")
++    with env_file.open("a", encoding="utf-8", newline="\n") as f:  # "\n" on Windows too
++        if text and not text.endswith("\n"):
++            f.write("\n")
++        f.write(f"LITELLM_MASTER_KEY=sk-{(new_secret or random_secret)()}\n")
++    if os.name != "nt":
++        env_file.chmod(0o600)  # readable by you only (Windows has no such permission bits)
++    done.append("added your own LITELLM_MASTER_KEY to .env (not shown: keep it private)")
++    return done
++
++
++def main() -> int:
++    for line in ensure_env(SERVICE_DIR):
++        print(f"- {line}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store review/scripts/warm_up.py cross-platform/scripts/warm_up.py
+--- review/scripts/warm_up.py	1970-01-01 05:30:00
++++ cross-platform/scripts/warm_up.py	2026-11-19 12:44:02
+@@ -0,0 +1,58 @@
++"""Load both tiers' models into memory before a demo. The same command on macOS, Linux, Windows:
++
++    uv run python scripts/warm_up.py
++
++The first request after a model has been unloaded pays a cold start: several seconds, and
++longer on a CPU. This pays it up front. The proxy address and key are read exactly the way
++the app reads them (Settings: your shell first, then .env), so "ok" here means the app will
++get through too. The cross-platform twin of warm-up.sh.
++"""
++
++import sys
++from collections.abc import Callable
++from pathlib import Path
++
++import httpx
++
++from trailmate_workflow.config import Settings
++
++SERVICE_DIR = Path(__file__).resolve().parent.parent  # trailmate-workflow/
++TIERS = ("fast", "smart")
++
++Post = Callable[..., httpx.Response]
++
++
++def warm(tier: str, settings: Settings, post: Post | None = None) -> str | None:
++    """Ask `tier` for a single token. None means it worked; otherwise, why it didn't."""
++    base_url = settings.litellm_base_url.rstrip("/")
++    try:
++        response = (post or httpx.post)(
++            f"{base_url}/chat/completions",
++            headers={"Authorization": f"Bearer {settings.litellm_api_key.get_secret_value()}"},
++            json={"model": tier, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
++            timeout=180,  # loading a model from disk onto a CPU can take a while
++        )
++    except httpx.ConnectError:
++        return f"no proxy at {base_url}. Start it first: uv run python scripts/run_proxy.py"
++    except httpx.TimeoutException:
++        return "timed out while the model was loading. Run this again"
++    if response.status_code == 401:
++        return "the proxy rejected the key. The app and the proxy need the same LITELLM_MASTER_KEY"
++    if response.is_error:
++        return f"HTTP {response.status_code} from the proxy. Its terminal shows why"
++    return None
++
++
++def main(post: Post | None = None) -> int:
++    settings = Settings(_env_file=SERVICE_DIR / ".env")
++    failed = False
++    for tier in TIERS:
++        print(f"warming {tier:<5} ... ", end="", flush=True)
++        reason = warm(tier, settings, post)
++        print("ok" if reason is None else f"FAILED: {reason}")
++        failed = failed or reason is not None
++    return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff -ruN -x __pycache__ -x .venv -x .pytest_cache -x .ruff_cache -x uv.lock -x fake_pii.py -x .env -x *.pyc -x .DS_Store review/tests/test_scripts.py cross-platform/tests/test_scripts.py
+--- review/tests/test_scripts.py	1970-01-01 05:30:00
++++ cross-platform/tests/test_scripts.py	2026-11-19 13:32:19
+@@ -0,0 +1,265 @@
++"""The cross-platform helper scripts in scripts/: setup_env, run_proxy, warm_up.
++
++They are the commands you type on Windows (which can't run the .sh scripts), and they work
++the same on a Mac. Every test here is hermetic: nothing starts the proxy, nothing touches
++the network, and no real key is ever made (a placeholder stands in for the secret).
++"""
++
++import importlib.util
++import os
++from pathlib import Path
++
++import httpx
++import pytest
++
++from trailmate_workflow.config import Settings
++
++SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
++
++
++def load(name: str):
++    """Import scripts/<name>.py. scripts/ holds runnable files, not a package."""
++    spec = importlib.util.spec_from_file_location(name, SCRIPTS / f"{name}.py")
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++setup_env = load("setup_env")
++run_proxy = load("run_proxy")
++warm_up = load("warm_up")
++
++
++def placeholder() -> str:
++    return "placeholder"
++
++
++@pytest.fixture
++def service(tmp_path: Path) -> Path:
++    """A stand-in trailmate-workflow folder with an .env.example and no .env."""
++    (tmp_path / ".env.example").write_text("LOG_LEVEL=INFO\n# LITELLM_MASTER_KEY=<yours>\n")
++    return tmp_path
++
++
++# --- setup_env: creates .env with your own key ---------------------------------------------
++
++
++def test_setup_env_copies_the_example_and_adds_a_key(service: Path) -> None:
++    done = setup_env.ensure_env(service, new_secret=placeholder)
++
++    text = (service / ".env").read_text()
++    assert text.startswith("LOG_LEVEL=INFO\n")  # copied from .env.example
++    assert text.endswith("\nLITELLM_MASTER_KEY=sk-placeholder\n")
++    assert any("created .env" in line for line in done)
++
++
++def test_setup_env_never_replaces_a_key(service: Path) -> None:
++    setup_env.ensure_env(service, new_secret=placeholder)
++    before = (service / ".env").read_text()
++
++    done = setup_env.ensure_env(service, new_secret=lambda: "another")
++
++    assert (service / ".env").read_text() == before
++    assert any("already set" in line for line in done)
++
++
++def test_setup_env_puts_the_key_on_its_own_line(service: Path) -> None:
++    (service / ".env").write_text("LOG_LEVEL=DEBUG")  # an existing .env with no final newline
++
++    setup_env.ensure_env(service, new_secret=placeholder)
++
++    assert (service / ".env").read_text() == "LOG_LEVEL=DEBUG\nLITELLM_MASTER_KEY=sk-placeholder\n"
++
++
++def test_setup_env_never_prints_the_key(
++    service: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
++) -> None:
++    monkeypatch.setattr(setup_env, "SERVICE_DIR", service)
++    monkeypatch.setattr(setup_env, "random_secret", lambda: "placeholder-value")
++
++    assert setup_env.main() == 0
++
++    assert "placeholder-value" not in capsys.readouterr().out
++    assert "sk-placeholder-value" in (service / ".env").read_text()
++
++
++@pytest.mark.skipif(os.name == "nt", reason="POSIX file permissions")
++def test_setup_env_makes_env_readable_by_you_only(service: Path) -> None:
++    setup_env.ensure_env(service, new_secret=placeholder)
++
++    assert (service / ".env").stat().st_mode & 0o777 == 0o600
++
++
++# --- run_proxy: the cross-platform twin of run-proxy.sh -------------------------------------
++
++
++def test_proxy_command_pins_litellm_and_its_python() -> None:
++    assert run_proxy.proxy_command() == [
++        "uvx", "--python", "3.12", "--from", "litellm[proxy]==1.110.0", "litellm",
++        "--config", "litellm/config.yaml", "--host", "127.0.0.1", "--port", "4000",
++    ]  # fmt: skip
++
++
++def test_the_shell_twin_starts_the_same_proxy() -> None:
++    script = (SCRIPTS / "run-proxy.sh").read_text(encoding="utf-8")
++
++    assert "--python 3.12" in script
++    assert run_proxy.LITELLM in script
++    assert "LITELLM_OFFLINE_MODE" in script
++
++
++def test_proxy_environment_lets_the_shell_win_over_dotenv(tmp_path: Path) -> None:
++    (tmp_path / ".env").write_text("LOG_LEVEL=INFO\nFROM_FILE=yes\n")
++
++    env = run_proxy.proxy_environment(tmp_path, {"LOG_LEVEL": "DEBUG"})
++
++    assert env["LOG_LEVEL"] == "DEBUG"  # the app (pydantic-settings) resolves it the same way
++    assert env["FROM_FILE"] == "yes"
++    assert env["LITELLM_OFFLINE_MODE"] == "true"  # LiteLLM never fetches anything on its own
++
++
++def test_offline_mode_can_still_be_turned_off(tmp_path: Path) -> None:
++    env = run_proxy.proxy_environment(tmp_path, {"LITELLM_OFFLINE_MODE": "false"})
++
++    assert env["LITELLM_OFFLINE_MODE"] == "false"
++
++
++def must_not_start(*args, **kwargs):
++    raise AssertionError("the proxy must not start")
++
++
++def test_run_proxy_without_a_key_explains_and_starts_nothing(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
++) -> None:
++    monkeypatch.setattr(run_proxy, "SERVICE_DIR", tmp_path)  # no .env there
++    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
++
++    assert run_proxy.main(popen=must_not_start) == 1
++    assert "uv run python scripts/setup_env.py" in capsys.readouterr().err
++
++
++class FinishedProxy:
++    def __init__(self) -> None:
++        self.waits: list[float | None] = []
++
++    def wait(self, timeout: float | None = None) -> int:
++        self.waits.append(timeout)
++        return 0
++
++
++def test_run_proxy_starts_the_pinned_proxy_with_the_key(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setattr(run_proxy, "SERVICE_DIR", tmp_path)
++    monkeypatch.setenv("LITELLM_MASTER_KEY", "placeholder")
++    started = {}
++
++    def popen(command, cwd, env):
++        started.update(command=command, cwd=cwd, env=env)
++        return FinishedProxy()
++
++    assert run_proxy.main(popen=popen, which=lambda name: f"/bin/{name}") == 0
++    assert started["command"] == run_proxy.proxy_command()
++    assert started["cwd"] == tmp_path  # litellm/config.yaml is relative to it
++    assert started["env"]["LITELLM_MASTER_KEY"] == "placeholder"
++
++
++def test_run_proxy_can_listen_on_another_port(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    # Windows sometimes reserves a port range that includes 4000 (WinError 10013).
++    monkeypatch.setattr(run_proxy, "SERVICE_DIR", tmp_path)
++    monkeypatch.setenv("LITELLM_MASTER_KEY", "placeholder")
++    started = {}
++
++    def popen(command, cwd, env):
++        started["command"] = command
++        return FinishedProxy()
++
++    assert run_proxy.main(["--port", "4100"], popen=popen, which=lambda name: name) == 0
++    assert started["command"][-2:] == ["--port", "4100"]
++
++
++def test_run_proxy_says_so_when_uv_is_missing(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
++) -> None:
++    monkeypatch.setattr(run_proxy, "SERVICE_DIR", tmp_path)
++    monkeypatch.setenv("LITELLM_MASTER_KEY", "placeholder")
++
++    assert run_proxy.main(popen=must_not_start, which=lambda name: None) == 1
++    assert "uvx" in capsys.readouterr().err
++
++
++def test_ctrl_c_lets_the_proxy_finish_shutting_down(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setattr(run_proxy, "SERVICE_DIR", tmp_path)
++    monkeypatch.setenv("LITELLM_MASTER_KEY", "placeholder")
++    proxy = FinishedProxy()
++    first_wait = proxy.wait
++
++    def interrupted_then_finished(timeout=None):
++        if not proxy.waits:  # Ctrl+C arrives while we wait for the proxy
++            proxy.waits.append(timeout)
++            raise KeyboardInterrupt
++        return first_wait(timeout)
++
++    proxy.wait = interrupted_then_finished
++
++    assert run_proxy.main(popen=lambda *a, **k: proxy, which=lambda name: name) == 0
++    assert proxy.waits == [None, 15]  # waited again, with a limit, for a clean shutdown
++
++
++# --- warm_up: loads both models, reading the address and key exactly as the app does -------
++
++
++@pytest.fixture
++def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
++    monkeypatch.setenv("LITELLM_API_KEY", "placeholder")
++    return Settings(_env_file=None)
++
++
++def test_warm_asks_a_tier_for_one_token(settings: Settings) -> None:
++    sent = {}
++
++    def post(url, headers, json, timeout):
++        sent.update(url=url, headers=headers, json=json)
++        return httpx.Response(200, json={})
++
++    assert warm_up.warm("smart", settings, post=post) is None
++    assert sent["url"] == "http://127.0.0.1:4000/v1/chat/completions"
++    assert sent["json"]["model"] == "smart"
++    assert sent["json"]["max_tokens"] == 1
++    assert sent["headers"]["Authorization"] == "Bearer placeholder"
++
++
++@pytest.mark.parametrize(
++    ("outcome", "explanation"),
++    [
++        (httpx.ConnectError("refused"), "uv run python scripts/run_proxy.py"),
++        (httpx.ReadTimeout("slow"), "Run this again"),
++        (httpx.Response(401), "same LITELLM_MASTER_KEY"),
++        (httpx.Response(500), "HTTP 500"),
++    ],
++)
++def test_warm_explains_each_failure(settings: Settings, outcome, explanation: str) -> None:
++    def post(*args, **kwargs):
++        if isinstance(outcome, Exception):
++            raise outcome
++        return outcome
++
++    assert explanation in warm_up.warm("fast", settings, post=post)
++
++
++def test_warm_up_reports_every_tier_and_fails_if_one_failed(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
++) -> None:
++    monkeypatch.setattr(warm_up, "SERVICE_DIR", tmp_path)
++
++    def post(url, headers, json, timeout):
++        return httpx.Response(200 if json["model"] == "fast" else 500)
++
++    assert warm_up.main(post=post) == 1
++    out = capsys.readouterr().out
++    assert "warming fast  ... ok" in out
++    assert "warming smart ... FAILED" in out
